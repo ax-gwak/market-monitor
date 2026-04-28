@@ -28,38 +28,55 @@ const DISPLAY_NAMES: Record<string, string> = {
   "BTC-USD":  "비트코인",
 };
 
+const UA = "Mozilla/5.0";
+
 function toYahoo(sym: string): string {
   return SYMBOL_MAP[sym.toUpperCase()] ?? sym;
 }
 
-async function fetchChart(yahooSym: string) {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1d&range=3y`;
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-      Accept: "application/json",
-    },
-    next: { revalidate: 300 },
-  });
-  if (!res.ok) throw new Error(`${yahooSym}: HTTP ${res.status}`);
+/* ─── 여러 심볼을 한 번에 조회 (spark 배치 요청) ─── */
+async function fetchSparkBatch(yahooSymbols: string[]): Promise<Record<string, { prices: number[]; timestamps: number[]; current: number; name: string }>> {
+  const symbolsParam = yahooSymbols.map(encodeURIComponent).join(",");
+  const url = `https://query1.finance.yahoo.com/v7/finance/spark?symbols=${symbolsParam}&range=3y&interval=1d`;
+
+  const fetchHeaders = {
+    "User-Agent": UA,
+    "Accept": "*/*",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+  };
+
+  let res = await fetch(url, { headers: fetchHeaders, cache: "no-store" });
+
+  if (!res.ok) {
+    res = await fetch(url.replace("query1", "query2"), { headers: fetchHeaders, cache: "no-store" });
+    if (!res.ok) throw new Error(`Spark batch HTTP ${res.status}`);
+  }
+
   const json = await res.json();
-  const result = json.chart?.result?.[0];
-  if (!result) throw new Error(`No data: ${yahooSym}`);
+  const results: Record<string, { prices: number[]; timestamps: number[]; current: number; name: string }> = {};
 
-  const rawTimestamps: number[] = result.timestamp ?? [];
-  const rawCloses: (number | null)[] = result.indicators?.quote?.[0]?.close ?? [];
+  for (const item of json.spark?.result ?? []) {
+    const yahooSym: string = item.symbol;
+    const result = item.response?.[0];
+    if (!result) continue;
 
-  // null 제거하면서 timestamp와 close를 함께 처리
-  const paired = rawTimestamps
-    .map((t, i) => ({ t, c: rawCloses[i] }))
-    .filter((p): p is { t: number; c: number } => p.c !== null && isFinite(p.c));
+    const rawTimestamps: number[] = result.timestamp ?? [];
+    const rawCloses: (number | null)[] = result.indicators?.quote?.[0]?.close ?? [];
 
-  const prices = paired.map(p => p.c);
-  const timestamps = paired.map(p => p.t * 1000); // ms로 변환
-  const current = prices[prices.length - 1] ?? 0;
-  const name: string = DISPLAY_NAMES[yahooSym] ?? result.meta?.shortName ?? yahooSym;
+    const paired = rawTimestamps
+      .map((t: number, i: number) => ({ t, c: rawCloses[i] }))
+      .filter((p): p is { t: number; c: number } => p.c != null && isFinite(p.c));
 
-  return { prices, timestamps, current, name };
+    const prices = paired.map(p => p.c);
+    const timestamps = paired.map(p => p.t * 1000);
+    const current: number = result.meta?.regularMarketPrice ?? prices.at(-1) ?? 0;
+    const name: string = DISPLAY_NAMES[yahooSym] ?? result.meta?.shortName ?? yahooSym;
+
+    results[yahooSym] = { prices, timestamps, current, name };
+  }
+
+  return results;
 }
 
 function sma(prices: number[], len: number): number {
@@ -75,41 +92,30 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    /* 워치리스트 심볼 병렬 조회 */
+    /* ── 1차 배치: 워치리스트 심볼 ── */
+    const watchlistYahoo = (symbols as string[]).map(toYahoo);
+    const watchlistData = await fetchSparkBatch(watchlistYahoo);
+
     const symbolResults: Record<string, { current: number; prices: number[]; timestamps: number[]; name: string }> = {};
-    await Promise.allSettled(
-      (symbols as string[]).map(async (sym) => {
-        try {
-          const d = await fetchChart(toYahoo(sym));
-          symbolResults[sym] = { current: d.current, prices: d.prices, timestamps: d.timestamps, name: d.name };
-        } catch (e) {
-          console.warn("symbol fetch failed:", sym, e);
-        }
-      })
-    );
+    (symbols as string[]).forEach(sym => {
+      const d = watchlistData[toYahoo(sym)];
+      if (d) symbolResults[sym] = d;
+    });
 
-    /* 매크로 지표 병렬 조회 */
-    const macroMap = {
-      spx:    "^GSPC",
-      vix:    "^VIX",
-      dxy:    "DX-Y.NYB",
-      us10y:  "^TNX",
-      kospi:  "^KS11",
-      usdkrw: "KRW=X",
+    /* ── 2차 배치: 매크로 지표 ── */
+    const macroYahooSymbols = ["^GSPC", "^VIX", "DX-Y.NYB", "^TNX", "^KS11", "KRW=X"];
+    const macroData = await fetchSparkBatch(macroYahooSymbols);
+
+    const macro = {
+      spx:    macroData["^GSPC"],
+      vix:    macroData["^VIX"],
+      dxy:    macroData["DX-Y.NYB"],
+      us10y:  macroData["^TNX"],
+      kospi:  macroData["^KS11"],
+      usdkrw: macroData["KRW=X"],
     };
-    const macro: Record<string, { prices: number[]; current: number }> = {};
-    await Promise.allSettled(
-      Object.entries(macroMap).map(async ([key, ySym]) => {
-        try {
-          const d = await fetchChart(ySym);
-          macro[key] = d;
-        } catch (e) {
-          console.warn("macro fetch failed:", key, e);
-        }
-      })
-    );
 
-    const spxRatio  = macro.spx   ? macro.spx.current   / sma(macro.spx.prices,   200) : 1;
+    const spxRatio   = macro.spx   ? macro.spx.current   / sma(macro.spx.prices,   200) : 1;
     const kospiRatio = macro.kospi ? macro.kospi.current / sma(macro.kospi.prices, 200) : 1;
 
     return NextResponse.json({
