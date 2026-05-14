@@ -10,8 +10,15 @@ const PHASE = {
   D: { label: "D 회복", color: "#185FA5", bg: "#E6F1FB", icon: "↑", tip: "분할 매수 시작 탐색" },
 };
 
-const TABS = ["cycle", "band", "ir"];
-const TAB_LABELS = { cycle: "Cycle phase", band: "Guide band", ir: "IR index" };
+const TABS = ["cycle", "band", "ir", "short", "long", "watchlist"];
+const TAB_LABELS = {
+  cycle: "Cycle phase",
+  band: "Guide band",
+  ir: "IR index",
+  short: "종목추천-단기",
+  long: "종목추천-장기",
+  watchlist: "관심종목",
+};
 
 const DEFAULT_WATCHLIST = [
   { symbol: "KOSPI200", name: "코스피200" },
@@ -715,6 +722,171 @@ function PhaseCompass({ re, im, phase, size = 220 }) {
   return <canvas ref={ref} style={{ width: size, height: size }} />;
 }
 
+/* ─── STOCK CARD ─── */
+function StockCard({ stock, onAddToWatchlist, inWatchlist, onRemove }) {
+  const isPositive = (stock.changeRate ?? 0) >= 0;
+  const changeColor = isPositive ? "#0F6E56" : "#A32D2D";
+  const changePrefix = isPositive ? "▲" : "▼";
+
+  return (
+    <div style={{
+      padding: "12px 14px",
+      borderRadius: 8,
+      border: "0.5px solid var(--color-border-tertiary)",
+      background: "var(--color-background-secondary)",
+      display: "flex",
+      flexDirection: "column",
+      gap: 6,
+    }}>
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 6 }}>
+        <div>
+          <span style={{ fontSize: 14, fontWeight: 600, color: "var(--color-text-primary)" }}>{stock.name}</span>
+          <span style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginLeft: 6 }}>
+            {stock.code} · {stock.market}
+          </span>
+        </div>
+        {stock.horizon && (
+          <span style={{
+            fontSize: 10, fontWeight: 500, padding: "2px 7px", borderRadius: 10,
+            background: stock.horizon === "1~2주" ? "#E1F5EE" : "#E6F1FB",
+            color: stock.horizon === "1~2주" ? "#0F6E56" : "#185FA5",
+            whiteSpace: "nowrap",
+          }}>
+            {stock.horizon}
+          </span>
+        )}
+      </div>
+
+      {/* Price */}
+      {stock.currentPrice > 0 && (
+        <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+          <span style={{ fontSize: 18, fontWeight: 600, color: "var(--color-text-primary)" }}>
+            {Math.round(stock.currentPrice).toLocaleString()}원
+          </span>
+          {stock.changeRate != null && (
+            <span style={{ fontSize: 12, color: changeColor, fontWeight: 500 }}>
+              {changePrefix} {Math.abs(stock.changeRate).toFixed(2)}%
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Reason */}
+      {stock.reason && (
+        <div style={{ fontSize: 12, color: "var(--color-text-secondary)", lineHeight: 1.5 }}>
+          {stock.reason}
+        </div>
+      )}
+
+      {/* Target / Stop-loss */}
+      {(stock.targetPrice || stock.stopLoss) && (
+        <div style={{ display: "flex", gap: 8, fontSize: 11 }}>
+          {stock.targetPrice && (
+            <span style={{ color: "#0F6E56" }}>
+              목표가 {Math.round(stock.targetPrice).toLocaleString()}원
+            </span>
+          )}
+          {stock.targetPrice && stock.stopLoss && (
+            <span style={{ color: "var(--color-text-tertiary)" }}>·</span>
+          )}
+          {stock.stopLoss && (
+            <span style={{ color: "#A32D2D" }}>
+              손절가 {Math.round(stock.stopLoss).toLocaleString()}원
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Score */}
+      {stock.score != null && (
+        <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>
+          점수: {stock.score}점
+        </div>
+      )}
+
+      {/* Buttons */}
+      <div style={{ display: "flex", gap: 6, marginTop: 2 }}>
+        {onAddToWatchlist && (
+          <button
+            onClick={() => onAddToWatchlist(stock)}
+            style={{
+              fontSize: 11, padding: "3px 10px", borderRadius: 6,
+              background: inWatchlist ? "var(--color-background-secondary)" : "transparent",
+              border: "0.5px solid var(--color-border-tertiary)",
+              cursor: inWatchlist ? "default" : "pointer",
+              color: inWatchlist ? "#0F6E56" : "var(--color-text-secondary)",
+            }}
+            disabled={inWatchlist}
+          >
+            {inWatchlist ? "✓ 관심종목" : "★ 관심종목 추가"}
+          </button>
+        )}
+        {onRemove && (
+          <button
+            onClick={onRemove}
+            style={{
+              fontSize: 11, padding: "3px 10px", borderRadius: 6,
+              background: "transparent",
+              border: "0.5px solid var(--color-border-tertiary)",
+              cursor: "pointer",
+              color: "#A32D2D",
+            }}
+          >
+            삭제
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ─── MARKET SECTION ─── */
+function MarketSection({ title, data, type, onAdd, watchlist }) {
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <div style={{ fontSize: 14, fontWeight: 600, color: "var(--color-text-primary)", marginBottom: 10 }}>
+        {title}
+      </div>
+      {data.large && data.large.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 12, color: "var(--color-text-tertiary)", marginBottom: 6 }}>대형주</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 10 }}>
+            {data.large.map(stock => (
+              <StockCard
+                key={stock.code}
+                stock={stock}
+                onAddToWatchlist={onAdd}
+                inWatchlist={!!(watchlist && watchlist.find(w => w.code === stock.code))}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+      {data.small && data.small.length > 0 && (
+        <div>
+          <div style={{ fontSize: 12, color: "var(--color-text-tertiary)", marginBottom: 6 }}>중소형주</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 10 }}>
+            {data.small.map(stock => (
+              <StockCard
+                key={stock.code}
+                stock={stock}
+                onAddToWatchlist={onAdd}
+                inWatchlist={!!(watchlist && watchlist.find(w => w.code === stock.code))}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+      {(!data.large || data.large.length === 0) && (!data.small || data.small.length === 0) && (
+        <div style={{ color: "var(--color-text-tertiary)", fontSize: 13, padding: "12px 0" }}>
+          추천 종목이 없습니다.
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ─── MAIN COMPONENT ─── */
 export default function IntegratedMonitor() {
   const [activeTab, setActiveTab] = useState("cycle");
@@ -731,8 +903,79 @@ export default function IntegratedMonitor() {
   const [irValues, setIrValues] = useState({});
   const [cycleData, setCycleData] = useState({ re: 0, im: 0 });
 
+  // Stock recommendation state
+  const [shortRecs, setShortRecs] = useState(null);
+  const [longRecs, setLongRecs] = useState(null);
+  const [recsLoading, setRecsLoading] = useState(false);
+  const [recsError, setRecsError] = useState("");
+
+  // Watchlist state
+  const [myWatchlist, setMyWatchlist] = useState([]);
+  const [wlSearch, setWlSearch] = useState("");
+  const [wlSearchResults, setWlSearchResults] = useState([]);
+  const [wlSearching, setWlSearching] = useState(false);
+
   const phase = getPhase(cycleData.re, cycleData.im);
   const pInfo = PHASE[phase];
+
+  // Load watchlist from localStorage on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("stock_watchlist");
+      if (saved) setMyWatchlist(JSON.parse(saved));
+    } catch { /* ignore */ }
+  }, []);
+
+  // Save watchlist to localStorage on change
+  useEffect(() => {
+    try {
+      localStorage.setItem("stock_watchlist", JSON.stringify(myWatchlist));
+    } catch { /* ignore */ }
+  }, [myWatchlist]);
+
+  // Auto-fetch recommendations when switching to short/long tabs
+  useEffect(() => {
+    if (activeTab === "short" && !shortRecs && !recsLoading) fetchRecs("short");
+    if (activeTab === "long" && !longRecs && !recsLoading) fetchRecs("long");
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
+
+  const fetchRecs = async (type) => {
+    setRecsLoading(true);
+    setRecsError("");
+    try {
+      const res = await fetch(`/api/stocks/recommend?type=${type}`);
+      if (!res.ok) throw new Error("추천 데이터 로드 실패");
+      const data = await res.json();
+      if (type === "short") setShortRecs(data);
+      else setLongRecs(data);
+    } catch (e) {
+      setRecsError(e.message);
+    }
+    setRecsLoading(false);
+  };
+
+  const addToWatchlist = (stock) => {
+    setMyWatchlist(prev => {
+      if (prev.find(w => w.code === stock.code)) return prev;
+      return [...prev, { ...stock, addedAt: new Date().toISOString() }];
+    });
+  };
+
+  const removeFromWatchlist = (code) => {
+    setMyWatchlist(prev => prev.filter(w => w.code !== code));
+  };
+
+  const searchWatchlist = async (query) => {
+    if (!query.trim()) { setWlSearchResults([]); return; }
+    setWlSearching(true);
+    try {
+      const res = await fetch(`/api/stocks/search?q=${encodeURIComponent(query)}`);
+      const data = await res.json();
+      setWlSearchResults(data);
+    } catch { setWlSearchResults([]); }
+    setWlSearching(false);
+  };
 
   const addSymbol = () => {
     const sym = searchInput.trim().toUpperCase();
@@ -1046,6 +1289,187 @@ export default function IntegratedMonitor() {
             When IR crosses above 1.0, the asset enters expansion mode. Below 1.0 signals contraction.
             {lastIR > 1 && lastIR < 1.02 && " IR just crossed 1.0 — critical juncture. Watch for confirmation."}
           </div>
+        </div>
+      )}
+
+      {/* ─── Short-term Recommendations Tab ─── */}
+      {activeTab === "short" && (
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+            <button
+              onClick={() => { setShortRecs(null); fetchRecs("short"); }}
+              disabled={recsLoading}
+              style={{ fontSize: 12, padding: "4px 12px" }}
+            >
+              {recsLoading ? "분석중..." : "↻ 갱신"}
+            </button>
+            {shortRecs && (
+              <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>
+                {new Date(shortRecs.generatedAt).toLocaleString("ko-KR")} 기준
+              </span>
+            )}
+          </div>
+          {recsError && (
+            <div style={{ color: "#A32D2D", fontSize: 13, marginBottom: 10 }}>{recsError}</div>
+          )}
+          {recsLoading && (
+            <div style={{ textAlign: "center", padding: 40, color: "var(--color-text-tertiary)" }}>
+              종목 분석 중... (30~60초 소요)
+            </div>
+          )}
+          {shortRecs && !recsLoading && (
+            <>
+              <MarketSection
+                title="코스피"
+                data={shortRecs.kospi}
+                type="short"
+                onAdd={addToWatchlist}
+                watchlist={myWatchlist}
+              />
+              <MarketSection
+                title="코스닥"
+                data={shortRecs.kosdaq}
+                type="short"
+                onAdd={addToWatchlist}
+                watchlist={myWatchlist}
+              />
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ─── Long-term Recommendations Tab ─── */}
+      {activeTab === "long" && (
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+            <button
+              onClick={() => { setLongRecs(null); fetchRecs("long"); }}
+              disabled={recsLoading}
+              style={{ fontSize: 12, padding: "4px 12px" }}
+            >
+              {recsLoading ? "분석중..." : "↻ 갱신"}
+            </button>
+            {longRecs && (
+              <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>
+                {new Date(longRecs.generatedAt).toLocaleString("ko-KR")} 기준
+              </span>
+            )}
+          </div>
+          {recsError && (
+            <div style={{ color: "#A32D2D", fontSize: 13, marginBottom: 10 }}>{recsError}</div>
+          )}
+          {recsLoading && (
+            <div style={{ textAlign: "center", padding: 40, color: "var(--color-text-tertiary)" }}>
+              종목 분석 중... (30~60초 소요)
+            </div>
+          )}
+          {longRecs && !recsLoading && (
+            <>
+              <MarketSection
+                title="코스피"
+                data={longRecs.kospi}
+                type="long"
+                onAdd={addToWatchlist}
+                watchlist={myWatchlist}
+              />
+              <MarketSection
+                title="코스닥"
+                data={longRecs.kosdaq}
+                type="long"
+                onAdd={addToWatchlist}
+                watchlist={myWatchlist}
+              />
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ─── Watchlist Tab ─── */}
+      {activeTab === "watchlist" && (
+        <div>
+          {/* Search bar */}
+          <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+            <input
+              placeholder="종목명 또는 코드 검색..."
+              value={wlSearch}
+              onChange={e => {
+                setWlSearch(e.target.value);
+                searchWatchlist(e.target.value);
+              }}
+              style={{ flex: 1, fontSize: 13 }}
+            />
+            {wlSearching && (
+              <span style={{ fontSize: 11, color: "var(--color-text-tertiary)", alignSelf: "center" }}>
+                검색중...
+              </span>
+            )}
+          </div>
+
+          {/* Search results */}
+          {wlSearchResults.length > 0 && (
+            <div style={{
+              marginBottom: 12,
+              border: "0.5px solid var(--color-border-tertiary)",
+              borderRadius: 8,
+              overflow: "hidden",
+              background: "var(--color-background-secondary)",
+            }}>
+              {wlSearchResults.map(r => (
+                <div
+                  key={r.code}
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    padding: "8px 12px",
+                    cursor: "pointer",
+                    borderBottom: "0.5px solid var(--color-border-tertiary)",
+                  }}
+                  onClick={() => {
+                    addToWatchlist(r);
+                    setWlSearch("");
+                    setWlSearchResults([]);
+                  }}
+                >
+                  <span style={{ fontSize: 13, color: "var(--color-text-primary)" }}>
+                    {r.name}{" "}
+                    <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>
+                      {r.code} {r.market}
+                    </span>
+                  </span>
+                  <span style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>
+                    {r.currentPrice ? `${r.currentPrice.toLocaleString()}원 · ` : ""}+ 추가
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Watchlist items */}
+          {myWatchlist.length === 0 ? (
+            <div style={{
+              textAlign: "center", padding: 40,
+              color: "var(--color-text-tertiary)", fontSize: 13, lineHeight: 1.8,
+            }}>
+              관심종목이 없습니다.<br />
+              종목 추천 탭에서 ★을 눌러 추가하거나 위에서 검색하여 추가하세요.
+            </div>
+          ) : (
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
+              gap: 10,
+            }}>
+              {myWatchlist.map(stock => (
+                <StockCard
+                  key={stock.code}
+                  stock={stock}
+                  inWatchlist={true}
+                  onRemove={() => removeFromWatchlist(stock.code)}
+                />
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
