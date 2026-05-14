@@ -36,6 +36,63 @@ function calcRsi(prices: number[], period: number = 14): number {
   return 100 - 100 / (1 + rs);
 }
 
+function calcMacd(closes: number[]): { macd: number; signal: number; histogram: number } {
+  if (closes.length < 26) return { macd: 0, signal: 0, histogram: 0 };
+  const ema12 = ema(closes, 12);
+  const ema26 = ema(closes, 26);
+  const macdLine = ema12.map((v, i) => v - ema26[i]);
+  const signalLine = ema(macdLine, 9);
+  const last = macdLine.length - 1;
+  const macd = macdLine[last];
+  const signal = signalLine[last];
+  return { macd, signal, histogram: macd - signal };
+}
+
+function calcBollingerBands(closes: number[], period: number = 20): {
+  upper: number; middle: number; lower: number; percentB: number;
+} {
+  if (closes.length < period) {
+    return { upper: 0, middle: 0, lower: 0, percentB: 0.5 };
+  }
+  const slice = closes.slice(-period);
+  const middle = slice.reduce((a, b) => a + b, 0) / period;
+  const variance = slice.reduce((sum, v) => sum + (v - middle) ** 2, 0) / period;
+  const stdDev = Math.sqrt(variance);
+  const upper = middle + 2 * stdDev;
+  const lower = middle - 2 * stdDev;
+  const last = closes[closes.length - 1];
+  const percentB = upper !== lower ? (last - lower) / (upper - lower) : 0.5;
+  return { upper, middle, lower, percentB };
+}
+
+function calcStochastic(closes: number[], period: number = 14): { k: number; d: number } {
+  if (closes.length < period) return { k: 50, d: 50 };
+  const kValues: number[] = [];
+  for (let i = Math.max(0, closes.length - 3 - period); i <= closes.length - period; i++) {
+    const slice = closes.slice(i, i + period);
+    const high = Math.max(...slice);
+    const low = Math.min(...slice);
+    const last = slice[slice.length - 1];
+    kValues.push(high !== low ? ((last - low) / (high - low)) * 100 : 50);
+  }
+  const k = kValues[kValues.length - 1] ?? 50;
+  const d = kValues.length >= 3
+    ? kValues.slice(-3).reduce((a, b) => a + b, 0) / 3
+    : k;
+  return { k, d };
+}
+
+/* ─── Normalization helper ─── */
+
+function clamp(val: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, val));
+}
+
+function normalize(val: number, min: number, max: number): number {
+  if (max === min) return 50;
+  return clamp(((val - min) / (max - min)) * 100, 0, 100);
+}
+
 /* ─── Short-term screener ─── */
 
 export interface ShortTermResult {
@@ -45,6 +102,9 @@ export interface ShortTermResult {
   volumeRatio: number;
   aboveEma20: boolean;
   aboveEma60: boolean;
+  macdHistogram: number;
+  bollingerPctB: number;
+  stochasticK: number;
   score: number;
   horizon: "1~2주" | "1달";
 }
@@ -52,7 +112,7 @@ export interface ShortTermResult {
 export function calcShortTermScore(
   prices: { close: number; volume: number }[]
 ): ShortTermResult | null {
-  if (prices.length < 60) return null;
+  if (prices.length < 20) return null;
 
   const closes = prices.map((p) => p.close);
   const volumes = prices.map((p) => p.volume);
@@ -66,8 +126,7 @@ export function calcShortTermScore(
       : 0;
   const roc20 =
     closes.length >= 21
-      ? ((last - closes[closes.length - 21]) / closes[closes.length - 21]) *
-        100
+      ? ((last - closes[closes.length - 21]) / closes[closes.length - 21]) * 100
       : 0;
 
   // RSI
@@ -75,45 +134,121 @@ export function calcShortTermScore(
 
   // EMA
   const ema20 = ema(closes, 20);
-  const ema60 = ema(closes, 60);
+  const ema60 = closes.length >= 60 ? ema(closes, 60) : null;
   const aboveEma20 = last > ema20[ema20.length - 1];
-  const aboveEma60 = last > ema60[ema60.length - 1];
+  const aboveEma60 = ema60 ? last > ema60[ema60.length - 1] : false;
+
+  // MACD
+  const { histogram: macdHistogram } = calcMacd(closes);
+
+  // Bollinger Bands
+  const { percentB: bollingerPctB } = calcBollingerBands(closes, 20);
+
+  // Stochastic
+  const { k: stochasticK } = calcStochastic(closes, 14);
 
   // Volume ratio (recent 5-day avg vs 20-day avg)
-  const recentVol =
-    volumes.slice(-5).reduce((a, b) => a + b, 0) / 5;
-  const baseVol =
-    volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
+  const recentVol = volumes.slice(-5).reduce((a, b) => a + b, 0) / 5;
+  const baseVol = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
   const volumeRatio = baseVol > 0 ? recentVol / baseVol : 1;
 
-  // Scoring
-  let score = 0;
+  // === Normalized scoring (0~100 scale per indicator, then weighted average) ===
+  const components: { value: number; weight: number }[] = [];
 
-  // RSI scoring
-  if (rsi14 >= 50 && rsi14 <= 70) score += 30;
-  else if (rsi14 >= 40 && rsi14 < 50) score += 15;
-  else if (rsi14 > 70) score += 10;
+  // RSI: 50~65 optimal zone for momentum, >70 overbought penalty, <30 oversold
+  let rsiScore: number;
+  if (rsi14 >= 50 && rsi14 <= 65) rsiScore = 90;
+  else if (rsi14 > 65 && rsi14 <= 70) rsiScore = 60;
+  else if (rsi14 >= 40 && rsi14 < 50) rsiScore = 50;
+  else if (rsi14 > 70 && rsi14 <= 80) rsiScore = 20;
+  else if (rsi14 > 80) rsiScore = 0;
+  else if (rsi14 >= 30 && rsi14 < 40) rsiScore = 30;
+  else rsiScore = 10;
+  components.push({ value: rsiScore, weight: 20 });
 
-  // ROC5 scoring
-  if (roc5 > 2) score += 25;
-  else if (roc5 > 0) score += 15;
+  // ROC5: momentum strength (threshold raised)
+  let roc5Score: number;
+  if (roc5 > 10) roc5Score = 100;
+  else if (roc5 > 5) roc5Score = 85;
+  else if (roc5 > 2) roc5Score = 65;
+  else if (roc5 > 0) roc5Score = 45;
+  else if (roc5 > -3) roc5Score = 25;
+  else roc5Score = 10;
+  components.push({ value: roc5Score, weight: 15 });
 
-  // ROC20 scoring
-  if (roc20 > 5) score += 20;
-  else if (roc20 > 0) score += 10;
+  // ROC20: medium-term trend (threshold raised)
+  let roc20Score: number;
+  if (roc20 > 15) roc20Score = 100;
+  else if (roc20 > 10) roc20Score = 85;
+  else if (roc20 > 5) roc20Score = 65;
+  else if (roc20 > 0) roc20Score = 45;
+  else if (roc20 > -5) roc20Score = 25;
+  else roc20Score = 10;
+  components.push({ value: roc20Score, weight: 10 });
 
-  // EMA scoring
-  if (aboveEma20) score += 15;
-  if (aboveEma60) score += 10;
+  // EMA trend: above both = strong, above 20 only = moderate
+  let emaScore = 0;
+  if (aboveEma20 && aboveEma60) emaScore = 100;
+  else if (aboveEma20) emaScore = 65;
+  else if (aboveEma60) emaScore = 40;
+  else emaScore = 10;
+  components.push({ value: emaScore, weight: 10 });
 
-  // Volume scoring
-  if (volumeRatio > 1.5) score += 10;
-  else if (volumeRatio > 1.2) score += 5;
+  // Volume: doubled weight, higher thresholds
+  let volScore: number;
+  if (volumeRatio > 3.0) volScore = 100;
+  else if (volumeRatio > 2.0) volScore = 85;
+  else if (volumeRatio > 1.5) volScore = 70;
+  else if (volumeRatio > 1.2) volScore = 50;
+  else if (volumeRatio > 0.8) volScore = 30;
+  else volScore = 10;
+  components.push({ value: volScore, weight: 20 });
+
+  // MACD histogram: positive = bullish momentum
+  let macdScore: number;
+  if (macdHistogram > 0 && last > 0) {
+    const macdRatio = (macdHistogram / last) * 100;
+    if (macdRatio > 1) macdScore = 100;
+    else if (macdRatio > 0.3) macdScore = 80;
+    else macdScore = 60;
+  } else if (macdHistogram > 0) {
+    macdScore = 60;
+  } else {
+    macdScore = 20;
+  }
+  components.push({ value: macdScore, weight: 10 });
+
+  // Bollinger %B: 0.5~0.8 optimal (above middle, not at upper)
+  let bbScore: number;
+  if (bollingerPctB >= 0.5 && bollingerPctB <= 0.8) bbScore = 90;
+  else if (bollingerPctB > 0.8 && bollingerPctB <= 1.0) bbScore = 50;
+  else if (bollingerPctB > 1.0) bbScore = 20;
+  else if (bollingerPctB >= 0.2 && bollingerPctB < 0.5) bbScore = 60;
+  else bbScore = 30;
+  components.push({ value: bbScore, weight: 8 });
+
+  // Stochastic: 20~80 zone, avoid extremes
+  let stochScore: number;
+  if (stochasticK >= 50 && stochasticK <= 80) stochScore = 85;
+  else if (stochasticK >= 30 && stochasticK < 50) stochScore = 60;
+  else if (stochasticK > 80) stochScore = 25;
+  else stochScore = 30;
+  components.push({ value: stochScore, weight: 7 });
+
+  // Weighted average → final score (0~100)
+  const totalWeight = components.reduce((sum, c) => sum + c.weight, 0);
+  const score = Math.round(
+    components.reduce((sum, c) => sum + c.value * c.weight, 0) / totalWeight
+  );
 
   const horizon: "1~2주" | "1달" =
-    rsi14 >= 55 && roc5 > 3 && volumeRatio > 1.3 ? "1~2주" : "1달";
+    rsi14 >= 55 && roc5 > 5 && volumeRatio > 1.5 ? "1~2주" : "1달";
 
-  return { rsi14, roc5, roc20, volumeRatio, aboveEma20, aboveEma60, score, horizon };
+  return {
+    rsi14, roc5, roc20, volumeRatio, aboveEma20, aboveEma60,
+    macdHistogram, bollingerPctB, stochasticK,
+    score, horizon,
+  };
 }
 
 /* ─── Long-term screener ─── */
@@ -144,7 +279,7 @@ export function calcLongTermScore(
     opsGrowthYoY?: number | null;
   }
 ): LongTermResult | null {
-  if (prices.length < 60) return null;
+  if (prices.length < 20) return null;
 
   const closes = prices.map((p) => p.close);
   const last = closes[closes.length - 1];
@@ -171,10 +306,18 @@ export function calcLongTermScore(
   const eps = fundamentals.eps ?? null;
   const opsGrowthYoY = fundamentals.opsGrowthYoY ?? null;
 
-  // EPS growth rate: (추정EPS - 현재EPS) / |현재EPS|
+  // EPS growth rate (improved: handle negative→positive turnaround separately)
   let epsGrowth: number | null = null;
-  if (cnsEps !== null && eps !== null && eps !== 0) {
-    epsGrowth = ((cnsEps - eps) / Math.abs(eps)) * 100;
+  if (cnsEps !== null && eps !== null) {
+    if (eps > 0) {
+      epsGrowth = ((cnsEps - eps) / eps) * 100;
+    } else if (eps < 0 && cnsEps > 0) {
+      epsGrowth = 200;
+    } else if (eps < 0 && cnsEps < 0) {
+      epsGrowth = eps !== 0 ? ((Math.abs(eps) - Math.abs(cnsEps)) / Math.abs(eps)) * 100 : null;
+    } else if (eps === 0) {
+      epsGrowth = cnsEps > 0 ? 100 : cnsEps < 0 ? -100 : 0;
+    }
   }
 
   // Effective PER: blend trailing PER (30%) + forward PER (70%)
@@ -189,71 +332,116 @@ export function calcLongTermScore(
     effectivePer = per;
   }
 
-  // Scoring
-  let score = 0;
+  // === Normalized scoring (0~100 scale per indicator, then weighted average) ===
+  const components: { value: number; weight: number }[] = [];
 
-  // === Effective PER scoring (replaces old PER-only scoring) ===
+  // Effective PER scoring
+  let perScore = 50;
   if (effectivePer !== null) {
-    if (effectivePer <= 8) score += 25;
-    else if (effectivePer <= 12) score += 20;
-    else if (effectivePer <= 18) score += 12;
-    else if (effectivePer <= 25) score += 5;
-    else if (effectivePer > 50) score -= 5;
+    if (effectivePer <= 5) perScore = 100;
+    else if (effectivePer <= 8) perScore = 90;
+    else if (effectivePer <= 12) perScore = 80;
+    else if (effectivePer <= 18) perScore = 60;
+    else if (effectivePer <= 25) perScore = 40;
+    else if (effectivePer <= 40) perScore = 25;
+    else if (effectivePer <= 50) perScore = 15;
+    else perScore = 5;
   }
-  // Penalty for negative trailing PER (loss-making company)
-  if (per !== null && per < 0) score -= 10;
+  if (per !== null && per < 0) perScore = Math.max(0, perScore - 30);
+  components.push({ value: perScore, weight: 20 });
 
-  // === EPS growth scoring (업황 개선 방향) ===
+  // EPS growth scoring
+  let epsScore = 50;
   if (epsGrowth !== null) {
-    if (epsGrowth > 100) score += 20;       // EPS 2x+ growth
-    else if (epsGrowth > 50) score += 15;   // strong growth
-    else if (epsGrowth > 20) score += 10;   // moderate growth
-    else if (epsGrowth > 0) score += 5;     // slight growth
-    else if (epsGrowth < -30) score -= 10;  // sharp decline (value trap warning)
-    else if (epsGrowth < -10) score -= 5;   // declining
+    if (epsGrowth >= 200) epsScore = 100;
+    else if (epsGrowth > 100) epsScore = 90;
+    else if (epsGrowth > 50) epsScore = 80;
+    else if (epsGrowth > 20) epsScore = 65;
+    else if (epsGrowth > 0) epsScore = 55;
+    else if (epsGrowth > -10) epsScore = 40;
+    else if (epsGrowth > -30) epsScore = 25;
+    else epsScore = 10;
   }
-  // Turnaround bonus: 적자→흑전
   if (eps !== null && eps < 0 && cnsEps !== null && cnsEps > 0) {
-    score += 10;
+    epsScore = Math.min(100, epsScore + 15);
   }
+  components.push({ value: epsScore, weight: 18 });
 
-  // === Operating profit growth scoring ===
+  // Operating profit growth scoring
+  let opsScore = 50;
   if (opsGrowthYoY !== null) {
-    if (opsGrowthYoY > 50) score += 12;
-    else if (opsGrowthYoY > 20) score += 8;
-    else if (opsGrowthYoY > 0) score += 4;
-    else if (opsGrowthYoY < -30) score -= 8;
-    else if (opsGrowthYoY < 0) score -= 3;
+    if (opsGrowthYoY > 100) opsScore = 100;
+    else if (opsGrowthYoY > 50) opsScore = 85;
+    else if (opsGrowthYoY > 20) opsScore = 70;
+    else if (opsGrowthYoY > 0) opsScore = 55;
+    else if (opsGrowthYoY > -10) opsScore = 40;
+    else if (opsGrowthYoY > -30) opsScore = 25;
+    else opsScore = 10;
   }
+  components.push({ value: opsScore, weight: 12 });
 
   // PBR scoring
+  let pbrScore = 50;
   if (pbr !== null) {
-    if (pbr > 0 && pbr <= 1) score += 18;
-    else if (pbr <= 1.5) score += 12;
-    else if (pbr <= 2) score += 6;
-    else if (pbr <= 3) score += 2;
-    else if (pbr > 8) score -= 3;
+    if (pbr > 0 && pbr <= 0.5) pbrScore = 100;
+    else if (pbr <= 1) pbrScore = 85;
+    else if (pbr <= 1.5) pbrScore = 65;
+    else if (pbr <= 2) pbrScore = 50;
+    else if (pbr <= 3) pbrScore = 35;
+    else if (pbr <= 5) pbrScore = 20;
+    else if (pbr <= 8) pbrScore = 10;
+    else pbrScore = 5;
   }
+  components.push({ value: pbrScore, weight: 15 });
 
   // Dividend yield scoring
+  let divScore = 30;
   if (dividendYield !== null) {
-    if (dividendYield > 4) score += 12;
-    else if (dividendYield > 2) score += 8;
-    else if (dividendYield > 1) score += 4;
+    if (dividendYield > 6) divScore = 100;
+    else if (dividendYield > 4) divScore = 85;
+    else if (dividendYield > 3) divScore = 70;
+    else if (dividendYield > 2) divScore = 55;
+    else if (dividendYield > 1) divScore = 40;
+    else divScore = 20;
   }
+  components.push({ value: divScore, weight: 10 });
 
-  // RSI scoring (oversold = opportunity for long-term)
-  if (rsi14 < 40) score += 8;
-  else if (rsi14 < 50) score += 4;
+  // RSI scoring (oversold = opportunity)
+  let rsiScore: number;
+  if (rsi14 < 30) rsiScore = 90;
+  else if (rsi14 < 40) rsiScore = 75;
+  else if (rsi14 < 50) rsiScore = 60;
+  else if (rsi14 < 60) rsiScore = 45;
+  else if (rsi14 < 70) rsiScore = 30;
+  else rsiScore = 15;
+  components.push({ value: rsiScore, weight: 5 });
 
-  // Price vs SMA200 scoring
-  if (priceVsSma200 < 0.9) score += 12;
-  else if (priceVsSma200 < 1.0) score += 8;
-  else if (priceVsSma200 < 1.05) score += 4;
+  // Price vs SMA200
+  let smaScore: number;
+  if (priceVsSma200 < 0.85) smaScore = 95;
+  else if (priceVsSma200 < 0.9) smaScore = 80;
+  else if (priceVsSma200 < 1.0) smaScore = 65;
+  else if (priceVsSma200 < 1.05) smaScore = 50;
+  else if (priceVsSma200 < 1.15) smaScore = 35;
+  else smaScore = 20;
+  components.push({ value: smaScore, weight: 10 });
 
   // Momentum 6m scoring
-  if (momentum6m >= 0 && momentum6m <= 30) score += 8;
-  else if (momentum6m >= -20 && momentum6m < 0) score += 4;
+  let momScore: number;
+  if (momentum6m >= 0 && momentum6m <= 15) momScore = 85;
+  else if (momentum6m > 15 && momentum6m <= 30) momScore = 70;
+  else if (momentum6m >= -10 && momentum6m < 0) momScore = 65;
+  else if (momentum6m >= -20 && momentum6m < -10) momScore = 50;
+  else if (momentum6m > 30 && momentum6m <= 50) momScore = 45;
+  else if (momentum6m < -20) momScore = 30;
+  else momScore = 20;
+  components.push({ value: momScore, weight: 10 });
+
+  // Weighted average → final score (0~100)
+  const totalWeight = components.reduce((sum, c) => sum + c.weight, 0);
+  const score = Math.round(
+    components.reduce((sum, c) => sum + c.value * c.weight, 0) / totalWeight
+  );
 
   return {
     momentum6m, belowSma200, rsi14,

@@ -722,8 +722,78 @@ function PhaseCompass({ re, im, phase, size = 220 }) {
   return <canvas ref={ref} style={{ width: size, height: size }} />;
 }
 
+/* ─── LOADING PROGRESS ─── */
+function LoadingProgress({ message }) {
+  return (
+    <div style={{ textAlign: "center", padding: 40 }}>
+      <div style={{ marginBottom: 12 }}>
+        <div style={{
+          width: 200, height: 4, background: "var(--color-border-tertiary)",
+          borderRadius: 2, margin: "0 auto", overflow: "hidden",
+        }}>
+          <div style={{
+            height: "100%", borderRadius: 2,
+            background: "linear-gradient(90deg, #185FA5, #0F6E56)",
+            animation: "loading-bar 2s ease-in-out infinite",
+          }} />
+        </div>
+      </div>
+      <div style={{ color: "var(--color-text-tertiary)", fontSize: 13 }}>
+        {message || "종목 분석 중..."}
+      </div>
+      <style>{`
+        @keyframes loading-bar {
+          0% { width: 5%; margin-left: 0; }
+          50% { width: 60%; margin-left: 20%; }
+          100% { width: 5%; margin-left: 95%; }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+/* ─── SORT CONTROLS ─── */
+function SortControls({ sortBy, sortDir, onSortChange }) {
+  const options = [
+    { value: "score", label: "점수순" },
+    { value: "changeRate", label: "등락률순" },
+    { value: "currentPrice", label: "가격순" },
+  ];
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 4, marginLeft: "auto" }}>
+      <select
+        value={sortBy}
+        onChange={e => onSortChange(e.target.value, sortDir)}
+        style={{ fontSize: 11, padding: "2px 4px", background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 4, color: "var(--color-text-secondary)" }}
+      >
+        {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+      </select>
+      <button
+        onClick={() => onSortChange(sortBy, sortDir === "desc" ? "asc" : "desc")}
+        style={{ fontSize: 11, padding: "2px 6px", background: "transparent", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 4, cursor: "pointer", color: "var(--color-text-secondary)" }}
+      >
+        {sortDir === "desc" ? "↓" : "↑"}
+      </button>
+    </div>
+  );
+}
+
+/* ─── SCORE BAR ─── */
+function ScoreBar({ score }) {
+  const color = score >= 70 ? "#0F6E56" : score >= 50 ? "#854F0B" : score >= 30 ? "#A32D2D" : "#666";
+  const label = score >= 70 ? "강력" : score >= 50 ? "양호" : score >= 30 ? "보통" : "약함";
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10 }}>
+      <div style={{ width: 60, height: 5, background: "var(--color-border-tertiary)", borderRadius: 3, overflow: "hidden" }}>
+        <div style={{ width: `${Math.min(score, 100)}%`, height: "100%", background: color, borderRadius: 3 }} />
+      </div>
+      <span style={{ color, fontWeight: 600 }}>{score}점 ({label})</span>
+    </div>
+  );
+}
+
 /* ─── STOCK CARD ─── */
-function StockCard({ stock, onAddToWatchlist, inWatchlist, onRemove }) {
+function StockCard({ stock, onAddToWatchlist, inWatchlist, onRemove, livePrice }) {
   const isPositive = (stock.changeRate ?? 0) >= 0;
   const changeColor = isPositive ? "#0F6E56" : "#A32D2D";
   const changePrefix = isPositive ? "▲" : "▼";
@@ -800,8 +870,13 @@ function StockCard({ stock, onAddToWatchlist, inWatchlist, onRemove }) {
 
       {/* Score */}
       {stock.score != null && (
+        <ScoreBar score={stock.score} />
+      )}
+
+      {/* Live price indicator for watchlist */}
+      {livePrice && (
         <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>
-          점수: {stock.score}점
+          실시간 가격: {livePrice.toLocaleString()}원 (1분 주기 갱신)
         </div>
       )}
 
@@ -842,17 +917,31 @@ function StockCard({ stock, onAddToWatchlist, inWatchlist, onRemove }) {
 }
 
 /* ─── MARKET SECTION ─── */
-function MarketSection({ title, data, type, onAdd, watchlist }) {
+function MarketSection({ title, data, type, onAdd, watchlist, sortBy = "score", sortDir = "desc" }) {
+  const sortStocks = (stocks) => {
+    if (!stocks) return [];
+    return [...stocks].sort((a, b) => {
+      const va = a[sortBy] ?? 0;
+      const vb = b[sortBy] ?? 0;
+      return sortDir === "desc" ? vb - va : va - vb;
+    });
+  };
+
+  const sortedLarge = sortStocks(data.large);
+  const sortedSmall = sortStocks(data.small);
+
   return (
     <div style={{ marginBottom: 20 }}>
       <div style={{ fontSize: 14, fontWeight: 600, color: "var(--color-text-primary)", marginBottom: 10 }}>
         {title}
       </div>
-      {data.large && data.large.length > 0 && (
+      {sortedLarge.length > 0 && (
         <div style={{ marginBottom: 14 }}>
-          <div style={{ fontSize: 12, color: "var(--color-text-tertiary)", marginBottom: 6 }}>대형주</div>
+          <div style={{ fontSize: 12, color: "var(--color-text-tertiary)", marginBottom: 6 }}>
+            대형주 ({sortedLarge.length}종목)
+          </div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 10 }}>
-            {data.large.map(stock => (
+            {sortedLarge.map(stock => (
               <StockCard
                 key={stock.code}
                 stock={stock}
@@ -863,11 +952,13 @@ function MarketSection({ title, data, type, onAdd, watchlist }) {
           </div>
         </div>
       )}
-      {data.small && data.small.length > 0 && (
+      {sortedSmall.length > 0 && (
         <div>
-          <div style={{ fontSize: 12, color: "var(--color-text-tertiary)", marginBottom: 6 }}>중소형주</div>
+          <div style={{ fontSize: 12, color: "var(--color-text-tertiary)", marginBottom: 6 }}>
+            중소형주 ({sortedSmall.length}종목)
+          </div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 10 }}>
-            {data.small.map(stock => (
+            {sortedSmall.map(stock => (
               <StockCard
                 key={stock.code}
                 stock={stock}
@@ -878,7 +969,7 @@ function MarketSection({ title, data, type, onAdd, watchlist }) {
           </div>
         </div>
       )}
-      {(!data.large || data.large.length === 0) && (!data.small || data.small.length === 0) && (
+      {sortedLarge.length === 0 && sortedSmall.length === 0 && (
         <div style={{ color: "var(--color-text-tertiary)", fontSize: 13, padding: "12px 0" }}>
           추천 종목이 없습니다.
         </div>
@@ -908,12 +999,16 @@ export default function IntegratedMonitor() {
   const [longRecs, setLongRecs] = useState(null);
   const [recsLoading, setRecsLoading] = useState(false);
   const [recsError, setRecsError] = useState("");
+  const [recsProgress, setRecsProgress] = useState("");
+  const [recsSortBy, setRecsSortBy] = useState("score");
+  const [recsSortDir, setRecsSortDir] = useState("desc");
 
   // Watchlist state
   const [myWatchlist, setMyWatchlist] = useState([]);
   const [wlSearch, setWlSearch] = useState("");
   const [wlSearchResults, setWlSearchResults] = useState([]);
   const [wlSearching, setWlSearching] = useState(false);
+  const [wlPrices, setWlPrices] = useState({});
 
   const phase = getPhase(cycleData.re, cycleData.im);
   const pInfo = PHASE[phase];
@@ -933,27 +1028,91 @@ export default function IntegratedMonitor() {
     } catch { /* ignore */ }
   }, [myWatchlist]);
 
+  // Client-side cache for recommendations (2 hour TTL)
+  const CACHE_TTL = 2 * 60 * 60 * 1000;
+  const getCachedRecs = (type) => {
+    try {
+      const raw = localStorage.getItem(`recs_cache_${type}`);
+      if (!raw) return null;
+      const { data, timestamp } = JSON.parse(raw);
+      if (Date.now() - timestamp > CACHE_TTL) return null;
+      return data;
+    } catch { return null; }
+  };
+  const setCachedRecs = (type, data) => {
+    try {
+      localStorage.setItem(`recs_cache_${type}`, JSON.stringify({ data, timestamp: Date.now() }));
+    } catch { /* ignore */ }
+  };
+
   // Auto-fetch recommendations when switching to short/long tabs
   useEffect(() => {
-    if (activeTab === "short" && !shortRecs && !recsLoading) fetchRecs("short");
-    if (activeTab === "long" && !longRecs && !recsLoading) fetchRecs("long");
+    if (activeTab === "short" && !shortRecs && !recsLoading) {
+      const cached = getCachedRecs("short");
+      if (cached) setShortRecs(cached);
+      else fetchRecs("short");
+    }
+    if (activeTab === "long" && !longRecs && !recsLoading) {
+      const cached = getCachedRecs("long");
+      if (cached) setLongRecs(cached);
+      else fetchRecs("long");
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
 
   const fetchRecs = async (type) => {
     setRecsLoading(true);
     setRecsError("");
+    setRecsProgress("데이터 수집 중...");
+
+    const progressTimer = setTimeout(() => setRecsProgress("기술적 분석 수행 중..."), 5000);
+    const progressTimer2 = setTimeout(() => setRecsProgress("AI 추천 생성 중..."), 15000);
+    const progressTimer3 = setTimeout(() => setRecsProgress("거의 완료..."), 40000);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120000);
+
     try {
-      const res = await fetch(`/api/stocks/recommend?type=${type}`);
+      const res = await fetch(`/api/stocks/recommend?type=${type}`, { signal: controller.signal });
       if (!res.ok) throw new Error("추천 데이터 로드 실패");
       const data = await res.json();
       if (type === "short") setShortRecs(data);
       else setLongRecs(data);
+      setCachedRecs(type, data);
     } catch (e) {
-      setRecsError(e.message);
+      if (e.name === "AbortError") setRecsError("요청 시간 초과 (2분). 다시 시도해주세요.");
+      else setRecsError(e.message);
     }
+    clearTimeout(progressTimer);
+    clearTimeout(progressTimer2);
+    clearTimeout(progressTimer3);
+    clearTimeout(timeout);
+    setRecsProgress("");
     setRecsLoading(false);
   };
+
+  // Watchlist price polling
+  useEffect(() => {
+    if (activeTab !== "watchlist" || myWatchlist.length === 0) return;
+    const fetchPrices = async () => {
+      const prices = {};
+      await Promise.all(
+        myWatchlist.map(async (stock) => {
+          try {
+            const res = await fetch(`/api/stocks/search?q=${encodeURIComponent(stock.code)}`);
+            const data = await res.json();
+            const found = data.find(d => d.code === stock.code);
+            if (found?.currentPrice) prices[stock.code] = found.currentPrice;
+          } catch { /* skip */ }
+        })
+      );
+      setWlPrices(prev => ({ ...prev, ...prices }));
+    };
+    fetchPrices();
+    const interval = setInterval(fetchPrices, 60000);
+    return () => clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, myWatchlist.length]);
 
   const addToWatchlist = (stock) => {
     setMyWatchlist(prev => {
@@ -1295,7 +1454,7 @@ export default function IntegratedMonitor() {
       {/* ─── Short-term Recommendations Tab ─── */}
       {activeTab === "short" && (
         <div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
             <button
               onClick={() => { setShortRecs(null); fetchRecs("short"); }}
               disabled={recsLoading}
@@ -1308,14 +1467,18 @@ export default function IntegratedMonitor() {
                 {new Date(shortRecs.generatedAt).toLocaleString("ko-KR")} 기준
               </span>
             )}
+            {shortRecs && !recsLoading && (
+              <SortControls sortBy={recsSortBy} sortDir={recsSortDir} onSortChange={(by, dir) => { setRecsSortBy(by); setRecsSortDir(dir); }} />
+            )}
           </div>
           {recsError && (
-            <div style={{ color: "#A32D2D", fontSize: 13, marginBottom: 10 }}>{recsError}</div>
+            <div style={{ color: "#A32D2D", fontSize: 13, marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+              {recsError}
+              <button onClick={() => fetchRecs("short")} style={{ fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>재시도</button>
+            </div>
           )}
           {recsLoading && (
-            <div style={{ textAlign: "center", padding: 40, color: "var(--color-text-tertiary)" }}>
-              종목 분석 중... (30~60초 소요)
-            </div>
+            <LoadingProgress message={recsProgress} />
           )}
           {shortRecs && !recsLoading && (
             <>
@@ -1325,6 +1488,8 @@ export default function IntegratedMonitor() {
                 type="short"
                 onAdd={addToWatchlist}
                 watchlist={myWatchlist}
+                sortBy={recsSortBy}
+                sortDir={recsSortDir}
               />
               <MarketSection
                 title="코스닥"
@@ -1332,6 +1497,8 @@ export default function IntegratedMonitor() {
                 type="short"
                 onAdd={addToWatchlist}
                 watchlist={myWatchlist}
+                sortBy={recsSortBy}
+                sortDir={recsSortDir}
               />
             </>
           )}
@@ -1341,7 +1508,7 @@ export default function IntegratedMonitor() {
       {/* ─── Long-term Recommendations Tab ─── */}
       {activeTab === "long" && (
         <div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
             <button
               onClick={() => { setLongRecs(null); fetchRecs("long"); }}
               disabled={recsLoading}
@@ -1354,14 +1521,18 @@ export default function IntegratedMonitor() {
                 {new Date(longRecs.generatedAt).toLocaleString("ko-KR")} 기준
               </span>
             )}
+            {longRecs && !recsLoading && (
+              <SortControls sortBy={recsSortBy} sortDir={recsSortDir} onSortChange={(by, dir) => { setRecsSortBy(by); setRecsSortDir(dir); }} />
+            )}
           </div>
           {recsError && (
-            <div style={{ color: "#A32D2D", fontSize: 13, marginBottom: 10 }}>{recsError}</div>
+            <div style={{ color: "#A32D2D", fontSize: 13, marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+              {recsError}
+              <button onClick={() => fetchRecs("long")} style={{ fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>재시도</button>
+            </div>
           )}
           {recsLoading && (
-            <div style={{ textAlign: "center", padding: 40, color: "var(--color-text-tertiary)" }}>
-              종목 분석 중... (30~60초 소요)
-            </div>
+            <LoadingProgress message={recsProgress} />
           )}
           {longRecs && !recsLoading && (
             <>
@@ -1371,6 +1542,8 @@ export default function IntegratedMonitor() {
                 type="long"
                 onAdd={addToWatchlist}
                 watchlist={myWatchlist}
+                sortBy={recsSortBy}
+                sortDir={recsSortDir}
               />
               <MarketSection
                 title="코스닥"
@@ -1378,6 +1551,8 @@ export default function IntegratedMonitor() {
                 type="long"
                 onAdd={addToWatchlist}
                 watchlist={myWatchlist}
+                sortBy={recsSortBy}
+                sortDir={recsSortDir}
               />
             </>
           )}
@@ -1463,9 +1638,10 @@ export default function IntegratedMonitor() {
               {myWatchlist.map(stock => (
                 <StockCard
                   key={stock.code}
-                  stock={stock}
+                  stock={{ ...stock, currentPrice: wlPrices[stock.code] || stock.currentPrice }}
                   inWatchlist={true}
                   onRemove={() => removeFromWatchlist(stock.code)}
+                  livePrice={wlPrices[stock.code]}
                 />
               ))}
             </div>

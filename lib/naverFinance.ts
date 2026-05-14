@@ -103,7 +103,10 @@ export async function fetchNaverFundamentals(
       }),
     ]);
 
-    if (!integrationRes.ok) return fallback;
+    if (!integrationRes.ok) {
+      console.warn(`[NaverFinance] Integration API failed for ${code}: HTTP ${integrationRes.status}`);
+      return fallback;
+    }
     const intData = await integrationRes.json();
 
     const infos: Array<{ code: string; value: string }> = intData?.totalInfos ?? [];
@@ -143,10 +146,13 @@ export async function fetchNaverFundamentals(
           }
         }
       }
-    } catch { /* ignore */ }
+    } catch (err) {
+      console.warn(`[NaverFinance] Summary parsing failed for ${code}:`, err instanceof Error ? err.message : err);
+    }
 
     return { price, changeRate, per, pbr, dividendYield, cnsPer, cnsEps, eps, opsGrowthYoY };
-  } catch {
+  } catch (err) {
+    console.error(`[NaverFinance] Fundamentals fetch failed for ${code}:`, err instanceof Error ? err.message : err);
     return fallback;
   }
 }
