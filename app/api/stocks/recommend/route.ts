@@ -249,6 +249,10 @@ export async function GET(req: NextRequest) {
         per: number | null;
         pbr: number | null;
         dividendYield: number | null;
+        cnsPer: number | null;
+        epsGrowth: number | null;
+        opsGrowthYoY: number | null;
+        effectivePer: number | null;
       }>
     > => {
       // First pass: screen without fundamentals to get top candidates
@@ -257,9 +261,7 @@ export async function GET(req: NextRequest) {
         const data = stockDataMap[stock.code];
         if (!data) continue;
         const result = calcLongTermScore(data.prices, {
-          per: null,
-          pbr: null,
-          dividendYield: null,
+          per: null, pbr: null, dividendYield: null,
         });
         if (!result) continue;
 
@@ -268,30 +270,28 @@ export async function GET(req: NextRequest) {
         const changeRate =
           prev > 0 ? ((data.current - prev) / prev) * 100 : 0;
 
-        preCandidates.push({
-          stock,
-          data,
-          result,
-          changeRate,
-        });
+        preCandidates.push({ stock, data, result, changeRate });
       }
 
       // Take top 20 by pre-score, then fetch fundamentals
       preCandidates.sort((a, b) => b.result.score - a.result.score);
       const top20 = preCandidates.slice(0, 20);
 
-      // Fetch fundamentals in parallel (with throttle)
       const fundResults = await Promise.all(
         top20.map(async ({ stock }) => {
           try {
             return await fetchNaverFundamentals(stock.code);
           } catch {
-            return { price: 0, changeRate: 0, per: null, pbr: null, dividendYield: null };
+            return {
+              price: 0, changeRate: 0,
+              per: null, pbr: null, dividendYield: null,
+              cnsPer: null, cnsEps: null, eps: null, opsGrowthYoY: null,
+            };
           }
         })
       );
 
-      // Re-score with fundamentals
+      // Re-score with full fundamentals
       const candidates = [];
       for (let i = 0; i < top20.length; i++) {
         const { stock, data, changeRate } = top20[i];
@@ -300,6 +300,10 @@ export async function GET(req: NextRequest) {
           per: fund.per,
           pbr: fund.pbr,
           dividendYield: fund.dividendYield,
+          cnsPer: fund.cnsPer,
+          cnsEps: fund.cnsEps,
+          eps: fund.eps,
+          opsGrowthYoY: fund.opsGrowthYoY,
         });
         if (!result) continue;
 
@@ -316,6 +320,10 @@ export async function GET(req: NextRequest) {
           per: fund.per,
           pbr: fund.pbr,
           dividendYield: fund.dividendYield,
+          cnsPer: fund.cnsPer,
+          epsGrowth: result.epsGrowth,
+          opsGrowthYoY: fund.opsGrowthYoY,
+          effectivePer: result.effectivePer,
         });
       }
 

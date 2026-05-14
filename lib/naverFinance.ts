@@ -16,6 +16,10 @@ export interface Fundamentals {
   per: number | null;
   pbr: number | null;
   dividendYield: number | null;
+  cnsPer: number | null;
+  cnsEps: number | null;
+  eps: number | null;
+  opsGrowthYoY: number | null;
 }
 
 /**
@@ -70,72 +74,78 @@ export async function fetchNaverPriceHistory(
   }
 }
 
+function parseNaverNum(val: string | undefined | null): number | null {
+  if (!val) return null;
+  const n = Number(String(val).replace(/[,배원%]/g, ""));
+  return isNaN(n) ? null : n;
+}
+
 /**
  * Fetch current price + fundamentals from Naver mobile API.
+ * Uses /integration for PER/PBR/cnsPer/cnsEps and /finance/summary for profit growth.
  */
 export async function fetchNaverFundamentals(
   code: string
 ): Promise<Fundamentals> {
   const fallback: Fundamentals = {
-    price: 0,
-    changeRate: 0,
-    per: null,
-    pbr: null,
-    dividendYield: null,
+    price: 0, changeRate: 0,
+    per: null, pbr: null, dividendYield: null,
+    cnsPer: null, cnsEps: null, eps: null, opsGrowthYoY: null,
   };
 
   try {
-    const basicUrl = `https://m.stock.naver.com/api/stock/${code}/basic`;
-    const basicRes = await fetch(basicUrl, {
-      headers: NAVER_HEADERS,
-      cache: "no-store",
-    });
+    const [integrationRes, summaryRes] = await Promise.all([
+      fetch(`https://m.stock.naver.com/api/stock/${code}/integration`, {
+        headers: NAVER_HEADERS, cache: "no-store",
+      }),
+      fetch(`https://m.stock.naver.com/api/stock/${code}/finance/summary`, {
+        headers: NAVER_HEADERS, cache: "no-store",
+      }),
+    ]);
 
-    if (!basicRes.ok) return fallback;
-    const basicData = await basicRes.json();
+    if (!integrationRes.ok) return fallback;
+    const intData = await integrationRes.json();
 
-    const priceStr: string = basicData?.closePrice ?? "0";
-    const price = Number(priceStr.replace(/,/g, ""));
-    const changeRate = Number(basicData?.fluctuationsRatio ?? 0);
+    const infos: Array<{ code: string; value: string }> = intData?.totalInfos ?? [];
+    const getField = (fieldCode: string) => infos.find(i => i.code === fieldCode)?.value;
 
-    let per: number | null = null;
-    let pbr: number | null = null;
-    let dividendYield: number | null = null;
+    const price = parseNaverNum(intData?.closePrice ?? getField("lastClosePrice")) ?? 0;
+    const changeRate = Number(intData?.fluctuationsRatio ?? 0);
 
+    const per = parseNaverNum(getField("per"));
+    const pbr = parseNaverNum(getField("pbr"));
+    const dividendYield = parseNaverNum(getField("dividendYieldRatio"));
+    const cnsPer = parseNaverNum(getField("cnsPer"));
+    const cnsEps = parseNaverNum(getField("cnsEps"));
+    const eps = parseNaverNum(getField("eps"));
+
+    let opsGrowthYoY: number | null = null;
     try {
-      const summaryUrl = `https://m.stock.naver.com/api/stock/${code}/finance/summary`;
-      const summaryRes = await fetch(summaryUrl, {
-        headers: NAVER_HEADERS,
-        cache: "no-store",
-      });
-
       if (summaryRes.ok) {
-        const summaryData = await summaryRes.json();
-        // Summary data structure varies; try common fields
-        const finData =
-          summaryData?.financeInfo ??
-          summaryData?.summary ??
-          summaryData ??
-          {};
+        const sumData = await summaryRes.json();
+        const annual = sumData?.chartIncomeStatement?.annual;
+        if (annual) {
+          const opsCols: string[] = annual.columns?.find((c: string[]) => c[0] === "영업이익") ?? [];
+          const titles: Array<{ isConsensus: string }> = annual.trTitleList ?? [];
 
-        const perVal = Number(finData?.per ?? finData?.PER ?? NaN);
-        const pbrVal = Number(finData?.pbr ?? finData?.PBR ?? NaN);
-        const divVal = Number(
-          finData?.dividendYield ??
-          finData?.dividend_yield ??
-          finData?.yieldOfDividend ??
-          NaN
-        );
-
-        per = isNaN(perVal) || perVal <= 0 ? null : perVal;
-        pbr = isNaN(pbrVal) || pbrVal <= 0 ? null : pbrVal;
-        dividendYield = isNaN(divVal) || divVal <= 0 ? null : divVal;
+          const actualOps: number[] = [];
+          for (let i = 1; i < opsCols.length && i <= titles.length; i++) {
+            if (titles[i - 1]?.isConsensus === "N") {
+              actualOps.push(Number(opsCols[i]));
+            }
+          }
+          if (actualOps.length >= 2) {
+            const prev = actualOps[actualOps.length - 2];
+            const curr = actualOps[actualOps.length - 1];
+            if (prev !== 0) {
+              opsGrowthYoY = ((curr - prev) / Math.abs(prev)) * 100;
+            }
+          }
+        }
       }
-    } catch {
-      // fundamentals optional; keep nulls
-    }
+    } catch { /* ignore */ }
 
-    return { price, changeRate, per, pbr, dividendYield };
+    return { price, changeRate, per, pbr, dividendYield, cnsPer, cnsEps, eps, opsGrowthYoY };
   } catch {
     return fallback;
   }

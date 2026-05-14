@@ -125,6 +125,10 @@ export interface LongTermResult {
   per: number | null;
   pbr: number | null;
   dividendYield: number | null;
+  cnsPer: number | null;
+  epsGrowth: number | null;
+  opsGrowthYoY: number | null;
+  effectivePer: number | null;
   score: number;
 }
 
@@ -134,6 +138,10 @@ export function calcLongTermScore(
     per: number | null;
     pbr: number | null;
     dividendYield: number | null;
+    cnsPer?: number | null;
+    cnsEps?: number | null;
+    eps?: number | null;
+    opsGrowthYoY?: number | null;
   }
 ): LongTermResult | null {
   if (prices.length < 60) return null;
@@ -158,45 +166,99 @@ export function calcLongTermScore(
   const rsi14 = calcRsi(closes, 14);
 
   const { per, pbr, dividendYield } = fundamentals;
+  const cnsPer = fundamentals.cnsPer ?? null;
+  const cnsEps = fundamentals.cnsEps ?? null;
+  const eps = fundamentals.eps ?? null;
+  const opsGrowthYoY = fundamentals.opsGrowthYoY ?? null;
+
+  // EPS growth rate: (추정EPS - 현재EPS) / |현재EPS|
+  let epsGrowth: number | null = null;
+  if (cnsEps !== null && eps !== null && eps !== 0) {
+    epsGrowth = ((cnsEps - eps) / Math.abs(eps)) * 100;
+  }
+
+  // Effective PER: blend trailing PER (30%) + forward PER (70%)
+  let effectivePer: number | null = null;
+  if (cnsPer !== null && cnsPer > 0) {
+    if (per !== null && per > 0) {
+      effectivePer = per * 0.3 + cnsPer * 0.7;
+    } else {
+      effectivePer = cnsPer;
+    }
+  } else if (per !== null && per > 0) {
+    effectivePer = per;
+  }
 
   // Scoring
   let score = 0;
 
-  // PER scoring
-  if (per !== null) {
-    if (per > 0 && per <= 10) score += 25;
-    else if (per <= 15) score += 20;
-    else if (per <= 20) score += 10;
-    else if (per <= 25) score += 5;
+  // === Effective PER scoring (replaces old PER-only scoring) ===
+  if (effectivePer !== null) {
+    if (effectivePer <= 8) score += 25;
+    else if (effectivePer <= 12) score += 20;
+    else if (effectivePer <= 18) score += 12;
+    else if (effectivePer <= 25) score += 5;
+    else if (effectivePer > 50) score -= 5;
+  }
+  // Penalty for negative trailing PER (loss-making company)
+  if (per !== null && per < 0) score -= 10;
+
+  // === EPS growth scoring (업황 개선 방향) ===
+  if (epsGrowth !== null) {
+    if (epsGrowth > 100) score += 20;       // EPS 2x+ growth
+    else if (epsGrowth > 50) score += 15;   // strong growth
+    else if (epsGrowth > 20) score += 10;   // moderate growth
+    else if (epsGrowth > 0) score += 5;     // slight growth
+    else if (epsGrowth < -30) score -= 10;  // sharp decline (value trap warning)
+    else if (epsGrowth < -10) score -= 5;   // declining
+  }
+  // Turnaround bonus: 적자→흑전
+  if (eps !== null && eps < 0 && cnsEps !== null && cnsEps > 0) {
+    score += 10;
+  }
+
+  // === Operating profit growth scoring ===
+  if (opsGrowthYoY !== null) {
+    if (opsGrowthYoY > 50) score += 12;
+    else if (opsGrowthYoY > 20) score += 8;
+    else if (opsGrowthYoY > 0) score += 4;
+    else if (opsGrowthYoY < -30) score -= 8;
+    else if (opsGrowthYoY < 0) score -= 3;
   }
 
   // PBR scoring
   if (pbr !== null) {
-    if (pbr > 0 && pbr <= 1) score += 20;
-    else if (pbr <= 1.5) score += 15;
-    else if (pbr <= 2) score += 8;
-    else if (pbr <= 3) score += 3;
+    if (pbr > 0 && pbr <= 1) score += 18;
+    else if (pbr <= 1.5) score += 12;
+    else if (pbr <= 2) score += 6;
+    else if (pbr <= 3) score += 2;
+    else if (pbr > 8) score -= 3;
   }
 
   // Dividend yield scoring
   if (dividendYield !== null) {
-    if (dividendYield > 4) score += 15;
-    else if (dividendYield > 2) score += 10;
-    else if (dividendYield > 1) score += 5;
+    if (dividendYield > 4) score += 12;
+    else if (dividendYield > 2) score += 8;
+    else if (dividendYield > 1) score += 4;
   }
 
   // RSI scoring (oversold = opportunity for long-term)
-  if (rsi14 < 40) score += 10;
-  else if (rsi14 < 50) score += 5;
+  if (rsi14 < 40) score += 8;
+  else if (rsi14 < 50) score += 4;
 
   // Price vs SMA200 scoring
-  if (priceVsSma200 < 0.9) score += 15;
-  else if (priceVsSma200 < 1.0) score += 10;
-  else if (priceVsSma200 < 1.05) score += 5;
+  if (priceVsSma200 < 0.9) score += 12;
+  else if (priceVsSma200 < 1.0) score += 8;
+  else if (priceVsSma200 < 1.05) score += 4;
 
   // Momentum 6m scoring
-  if (momentum6m >= 0 && momentum6m <= 30) score += 10;
-  else if (momentum6m >= -20 && momentum6m < 0) score += 5;
+  if (momentum6m >= 0 && momentum6m <= 30) score += 8;
+  else if (momentum6m >= -20 && momentum6m < 0) score += 4;
 
-  return { momentum6m, belowSma200, rsi14, per, pbr, dividendYield, score };
+  return {
+    momentum6m, belowSma200, rsi14,
+    per, pbr, dividendYield,
+    cnsPer, epsGrowth, opsGrowthYoY, effectivePer,
+    score,
+  };
 }
