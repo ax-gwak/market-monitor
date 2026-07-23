@@ -10,11 +10,12 @@ const PHASE = {
   D: { label: "D 회복", color: "#185FA5", bg: "#E6F1FB", icon: "↑", tip: "분할 매수 시작 탐색" },
 };
 
-const TABS = ["cycle", "band", "ir", "short", "long", "watchlist"];
+const TABS = ["cycle", "band", "ir", "scenario", "short", "long", "watchlist"];
 const TAB_LABELS = {
   cycle: "Cycle phase",
   band: "Guide band",
   ir: "IR index",
+  scenario: "시나리오",
   short: "종목추천-단기",
   long: "종목추천-장기",
   watchlist: "관심종목",
@@ -722,6 +723,1161 @@ function PhaseCompass({ re, im, phase, size = 220 }) {
   return <canvas ref={ref} style={{ width: size, height: size }} />;
 }
 
+/* ─── NORMAL CDF APPROXIMATION ─── */
+function normCDF(x) {
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741, a4 = -1.453152027, a5 = 1.061405429;
+  const sign = x < 0 ? -1 : 1;
+  x = Math.abs(x) / Math.SQRT2;
+  const t = 1 / (1 + 0.3275911 * x);
+  const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+  return 0.5 * (1 + sign * y);
+}
+
+/* ─── BACKTEST ENGINE ─── */
+function runBacktest(prices) {
+  const LEVELS = [5, 10, 15, 20, 25];
+  const HORIZONS = [
+    { label: "1일", days: 1 },
+    { label: "3일", days: 3 },
+    { label: "1주일", days: 5 },
+    { label: "2주일", days: 10 },
+    { label: "1개월", days: 21 },
+  ];
+  const START = 260;
+  const END = prices.length - 22;
+  if (END <= START) return null;
+
+  const cVol = (rets) => {
+    if (rets.length < 2) return 0.01;
+    const m = rets.reduce((a, b) => a + b, 0) / rets.length;
+    return Math.sqrt(rets.reduce((a, r) => a + (r - m) ** 2, 0) / (rets.length - 1));
+  };
+
+  // Pre-compute all log returns
+  const allReturns = [];
+  for (let i = 1; i < prices.length; i++) allReturns.push(Math.log(prices[i] / prices[i - 1]));
+
+  // Pre-compute EMAs for full series
+  const eCalc = (arr, len) => {
+    const k = 2 / (len + 1); const r = [arr[0]];
+    for (let i = 1; i < arr.length; i++) r.push(arr[i] * k + r[i - 1] * (1 - k));
+    return r;
+  };
+  const allEma5 = eCalc(prices, 5);
+  const allEma12 = eCalc(prices, 12);
+  const allEma20 = eCalc(prices, 20);
+  const allEma26 = eCalc(prices, 26);
+  const allEma60 = eCalc(prices, Math.min(60, prices.length - 1));
+
+  // Results collectors
+  const calibBuckets = {};
+  for (let b = 0; b <= 90; b += 10) calibBuckets[b] = { preds: [], actuals: [] };
+  const dirByHorizon = {};
+  HORIZONS.forEach(h => { dirByHorizon[h.label] = { correct: 0, total: 0 }; });
+  let brierSum = 0, brierCount = 0;
+
+  for (let t = START; t < END; t++) {
+    const cp = prices[t];
+    const rets = allReturns.slice(0, t);
+    const meanRet = rets.reduce((a, b) => a + b, 0) / rets.length;
+
+    // Rolling volatilities
+    const v10 = cVol(rets.slice(-10));
+    const v20 = cVol(rets.slice(-20));
+    const v60 = cVol(rets.slice(-60));
+    const vFull = cVol(rets);
+    const blended = v10 * 0.35 + v20 * 0.30 + v60 * 0.20 + vFull * 0.15;
+
+    // SMA200 & band sigma
+    const s200s = prices.slice(Math.max(0, t - 199), t + 1);
+    const s200 = s200s.reduce((a, b) => a + b, 0) / s200s.length;
+    const sd200 = Math.sqrt(s200s.reduce((a, p) => a + (p - s200) ** 2, 0) / s200s.length);
+    const bSigma = sd200 > 0 ? (cp - s200) / sd200 : 0;
+
+    // Direction signals
+    const mom5 = t >= 5 ? (cp / prices[t - 5] - 1) : 0;
+    const mom10 = t >= 10 ? (cp / prices[t - 10] - 1) : 0;
+    const mom20 = t >= 20 ? (cp / prices[t - 20] - 1) : 0;
+    const momSig = Math.tanh((mom5 * 3 + mom10 * 2 + mom20) / 6 * 30);
+
+    const maAlign = ((allEma5[t] > allEma20[t] ? 1 : -1) + (allEma20[t] > allEma60[t] ? 1 : -1) + (cp > allEma20[t] ? 1 : -1)) / 3;
+
+    let gains = 0, losses = 0;
+    const rsiR = rets.slice(-14);
+    for (const r of rsiR) { if (r > 0) gains += r; else losses -= r; }
+    const aG = gains / 14, aL = losses / 14;
+    const rsi = aL === 0 ? 100 : 100 - 100 / (1 + aG / aL);
+    const rsiSig = (50 - rsi) / 50;
+
+    const macdL = allEma12[t] - allEma26[t];
+    const macdP = t >= 1 ? allEma12[t - 1] - allEma26[t - 1] : macdL;
+    const macdN = cp > 0 ? macdL / cp * 100 : 0;
+    const macdA = cp > 0 ? (macdL - macdP) / cp * 100 : 0;
+    const macdSig = Math.tanh((macdN * 2 + macdA * 5) * 10);
+
+    const bDrift = -bSigma * 0.25;
+    // Cycle phase not available historically → redistribute weights
+    const dirScore = momSig * 0.30 + maAlign * 0.24 + rsiSig * 0.12 + macdSig * 0.18 + bDrift * 0.16;
+    const cDir = Math.max(-1, Math.min(1, dirScore));
+    const adjDrift = meanRet + cDir * blended * 0.8;
+
+    const getHVol = (d) => {
+      if (d <= 1) return v10;
+      if (d <= 3) return v10 * 0.6 + v20 * 0.3 + v60 * 0.1;
+      if (d <= 5) return v20 * 0.5 + v60 * 0.3 + vFull * 0.2;
+      if (d <= 10) return v20 * 0.3 + v60 * 0.4 + vFull * 0.3;
+      return v60 * 0.4 + vFull * 0.6;
+    };
+
+    for (const h of HORIZONS) {
+      if (t + h.days >= prices.length) continue;
+      const futureP = prices[t + h.days];
+      const actualPct = (futureP - cp) / cp * 100;
+
+      // Direction accuracy
+      if (Math.abs(cDir) > 0.05) {
+        dirByHorizon[h.label].total++;
+        if ((cDir > 0 && actualPct > 0) || (cDir < 0 && actualPct < 0)) {
+          dirByHorizon[h.label].correct++;
+        }
+      }
+
+      const hVol = getHVol(h.days);
+      const vol = hVol * Math.sqrt(h.days);
+      const drift = adjDrift * h.days;
+
+      for (const pct of LEVELS) {
+        // Upside
+        const upTarget = Math.log(1 + pct / 100);
+        const upProb = (1 - normCDF((upTarget - drift) / vol)) * 100;
+        const upActual = actualPct >= pct ? 1 : 0;
+        const upBucket = Math.min(90, Math.floor(upProb / 10) * 10);
+        calibBuckets[upBucket].preds.push(upProb);
+        calibBuckets[upBucket].actuals.push(upActual * 100);
+        brierSum += (upProb / 100 - upActual) ** 2;
+        brierCount++;
+
+        // Downside
+        const dnTarget = Math.log(1 - pct / 100);
+        const dnProb = normCDF((dnTarget - drift) / vol) * 100;
+        const dnActual = actualPct <= -pct ? 1 : 0;
+        const dnBucket = Math.min(90, Math.floor(dnProb / 10) * 10);
+        calibBuckets[dnBucket].preds.push(dnProb);
+        calibBuckets[dnBucket].actuals.push(dnActual * 100);
+        brierSum += (dnProb / 100 - dnActual) ** 2;
+        brierCount++;
+      }
+    }
+  }
+
+  // Process results
+  const calibration = [];
+  let eceSum = 0, eceCount = 0;
+  for (let b = 0; b <= 90; b += 10) {
+    const d = calibBuckets[b];
+    if (d.preds.length > 0) {
+      const avgP = d.preds.reduce((a, v) => a + v, 0) / d.preds.length;
+      const avgA = d.actuals.reduce((a, v) => a + v, 0) / d.actuals.length;
+      calibration.push({ bucket: `${b}-${b + 10}`, avgPredicted: avgP, avgActual: avgA, count: d.preds.length });
+      eceSum += Math.abs(avgP - avgA) * d.preds.length;
+      eceCount += d.preds.length;
+    }
+  }
+
+  const dirHorizonArr = HORIZONS.map(h => ({
+    label: h.label,
+    accuracy: dirByHorizon[h.label].total > 0 ? dirByHorizon[h.label].correct / dirByHorizon[h.label].total * 100 : 0,
+    count: dirByHorizon[h.label].total,
+  }));
+
+  const totalDirCorrect = dirHorizonArr.reduce((a, h) => a + h.count * h.accuracy / 100, 0);
+  const totalDirCount = dirHorizonArr.reduce((a, h) => a + h.count, 0);
+
+  return {
+    testDays: END - START,
+    dirAccuracy: totalDirCount > 0 ? totalDirCorrect / totalDirCount * 100 : 0,
+    dirTotal: totalDirCount,
+    dirByHorizon: dirHorizonArr,
+    brierScore: brierCount > 0 ? brierSum / brierCount : 0,
+    calError: eceCount > 0 ? eceSum / eceCount : 0,
+    calibration,
+  };
+}
+
+/* ─── 과거 N일간 확률 매트릭스 재계산 ─── */
+function computeRetroMatrices(allPrices, allDates, numDays) {
+  const LEVELS = [25, 20, 15, 10, 5];
+  const HORIZONS = [
+    { label: "1일", days: 1 },
+    { label: "3일", days: 3 },
+    { label: "1주일", days: 5 },
+    { label: "2주일", days: 10 },
+    { label: "1개월", days: 21 },
+  ];
+
+  const emaCalc = (arr, len) => {
+    const k = 2 / (len + 1); const r = [arr[0]];
+    for (let i = 1; i < arr.length; i++) r.push(arr[i] * k + r[i - 1] * (1 - k));
+    return r;
+  };
+  const calcVol = (rets) => {
+    const m = rets.reduce((a, b) => a + b, 0) / rets.length;
+    return Math.sqrt(rets.reduce((a, r) => a + (r - m) ** 2, 0) / (rets.length - 1));
+  };
+
+  const results = [];
+
+  for (let daysAgo = 1; daysAgo <= numDays; daysAgo++) {
+    const endIdx = allPrices.length - daysAgo;
+    if (endIdx < 60) continue;
+
+    const prices = allPrices.slice(0, endIdx);
+    const basePrice = prices[prices.length - 1];
+    const baseDate = allDates[endIdx - 1];
+
+    const returns = [];
+    for (let i = 1; i < prices.length; i++) returns.push(Math.log(prices[i] / prices[i - 1]));
+
+    const recent10 = returns.slice(-10);
+    const recent20 = returns.slice(-20);
+    const recent60 = returns.slice(-60);
+    const vol10Daily = calcVol(recent10);
+    const vol20Daily = calcVol(recent20);
+    const vol60Daily = calcVol(recent60);
+    const volFullDaily = calcVol(returns);
+    const blendedDailyVol = vol10Daily * 0.35 + vol20Daily * 0.30 + vol60Daily * 0.20 + volFullDaily * 0.15;
+    const meanReturn = returns.reduce((a, b) => a + b, 0) / returns.length;
+
+    const sma200Len = Math.min(200, prices.length);
+    const sma200Slice = prices.slice(-sma200Len);
+    const sma200 = sma200Slice.reduce((a, b) => a + b, 0) / sma200Slice.length;
+    const sd200 = Math.sqrt(sma200Slice.reduce((a, p) => a + (p - sma200) ** 2, 0) / sma200Len);
+    const bandSigma = sd200 > 0 ? (basePrice - sma200) / sd200 : 0;
+
+    const mom5 = prices.length >= 6 ? (basePrice / prices[prices.length - 6] - 1) : 0;
+    const mom10 = prices.length >= 11 ? (basePrice / prices[prices.length - 11] - 1) : 0;
+    const mom20 = prices.length >= 21 ? (basePrice / prices[prices.length - 21] - 1) : 0;
+    const momSignal = Math.tanh((mom5 * 3 + mom10 * 2 + mom20 * 1) / 6 * 30);
+
+    const ema5 = emaCalc(prices, 5);
+    const ema20 = emaCalc(prices, 20);
+    const ema60 = emaCalc(prices, Math.min(60, prices.length - 1));
+    const maAlignScore = ((ema5[ema5.length - 1] > ema20[ema20.length - 1] ? 1 : -1) + (ema20[ema20.length - 1] > ema60[ema60.length - 1] ? 1 : -1) + (basePrice > ema20[ema20.length - 1] ? 1 : -1)) / 3;
+
+    const rsiLen = 14;
+    let gains = 0, losses = 0;
+    const rsiReturns = returns.slice(-rsiLen);
+    for (const r of rsiReturns) { if (r > 0) gains += r; else losses -= r; }
+    const avgGain = gains / rsiLen;
+    const avgLoss = losses / rsiLen;
+    const rsi = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+    const rsiSignal = (50 - rsi) / 50;
+
+    const ema12 = emaCalc(prices, 12);
+    const ema26 = emaCalc(prices, 26);
+    const macdLine = ema12[ema12.length - 1] - ema26[ema26.length - 1];
+    const macdPrev = ema12.length >= 2 ? ema12[ema12.length - 2] - ema26[ema26.length - 2] : macdLine;
+    const macdNorm = basePrice > 0 ? macdLine / basePrice * 100 : 0;
+    const macdAccel = basePrice > 0 ? (macdLine - macdPrev) / basePrice * 100 : 0;
+    const macdSignal = Math.tanh((macdNorm * 2 + macdAccel * 5) * 10);
+
+    const bandDrift = -bandSigma * 0.25;
+
+    const directionScore = momSignal * 0.30 + maAlignScore * 0.24 + rsiSignal * 0.12 + macdSignal * 0.18 + bandDrift * 0.16;
+    const clampedDirection = Math.max(-1, Math.min(1, directionScore));
+    const adjustedDrift = meanReturn + clampedDirection * blendedDailyVol * 0.8;
+
+    const getHorizonVol = (horizonDays) => {
+      if (horizonDays <= 1) return vol10Daily;
+      if (horizonDays <= 3) return vol10Daily * 0.6 + vol20Daily * 0.3 + vol60Daily * 0.1;
+      if (horizonDays <= 5) return vol20Daily * 0.5 + vol60Daily * 0.3 + volFullDaily * 0.2;
+      if (horizonDays <= 10) return vol20Daily * 0.3 + vol60Daily * 0.4 + volFullDaily * 0.3;
+      return vol60Daily * 0.4 + volFullDaily * 0.6;
+    };
+
+    const matrix = {};
+    for (const h of HORIZONS) {
+      const hVol = getHorizonVol(h.days);
+      const vol = hVol * Math.sqrt(h.days);
+      const drift = adjustedDrift * h.days;
+      matrix[h.label] = {};
+      for (const pct of LEVELS) {
+        const upTarget = Math.log(1 + pct / 100);
+        const dnTarget = Math.log(1 - pct / 100);
+        matrix[h.label][pct] = {
+          up: (1 - normCDF((upTarget - drift) / vol)) * 100,
+          down: normCDF((dnTarget - drift) / vol) * 100,
+        };
+      }
+    }
+
+    const actuals = {};
+    for (const h of HORIZONS) {
+      const futureIdx = endIdx - 1 + h.days;
+      if (futureIdx < allPrices.length) {
+        const futurePrice = allPrices[futureIdx];
+        actuals[h.label] = ((futurePrice - basePrice) / basePrice) * 100;
+      } else {
+        actuals[h.label] = null;
+      }
+    }
+
+    results.push({
+      date: baseDate,
+      basePrice,
+      direction: clampedDirection,
+      annualVol: blendedDailyVol * Math.sqrt(252) * 100,
+      matrix,
+      actuals,
+    });
+  }
+
+  return results;
+}
+
+/* ─── SCENARIO MATRIX ─── */
+function ScenarioMatrix({ prices, dates, phase, cycleData, label, hasRealData }) {
+  const [btResults, setBtResults] = useState(null);
+  const [btRunning, setBtRunning] = useState(false);
+  const [retroMode, setRetroMode] = useState(null);
+  const [retroData, setRetroData] = useState(null);
+  const [retroLoading, setRetroLoading] = useState(false);
+
+  const LEVELS = [25, 20, 15, 10, 5];
+  const HORIZONS = [
+    { label: "1일", days: 1 },
+    { label: "3일", days: 3 },
+    { label: "1주일", days: 5 },
+    { label: "2주일", days: 10 },
+    { label: "1개월", days: 21 },
+  ];
+
+  if (!prices || prices.length < 60) {
+    return (
+      <div style={{ textAlign: "center", padding: 40, color: "var(--color-text-tertiary)", fontSize: 13 }}>
+        데이터를 먼저 불러와주세요. (Fetch data 버튼)
+      </div>
+    );
+  }
+
+  const currentPrice = prices[prices.length - 1];
+
+  // 일별 수익률
+  const returns = [];
+  for (let i = 1; i < prices.length; i++) {
+    returns.push(Math.log(prices[i] / prices[i - 1]));
+  }
+
+  // 구간별 변동성 계산 헬퍼
+  const calcVol = (rets) => {
+    const m = rets.reduce((a, b) => a + b, 0) / rets.length;
+    return Math.sqrt(rets.reduce((a, r) => a + (r - m) ** 2, 0) / (rets.length - 1));
+  };
+
+  const recent10 = returns.slice(-10);
+  const recent20 = returns.slice(-20);
+  const recent60 = returns.slice(-60);
+  const vol10Daily = calcVol(recent10);
+  const vol20Daily = calcVol(recent20);
+  const vol60Daily = calcVol(recent60);
+  const volFullDaily = calcVol(returns);
+
+  // 가중 혼합 변동성: 단기에 무게를 두되 장기로 앵커링
+  // 10일(35%) + 20일(30%) + 60일(20%) + 전체(15%)
+  const blendedDailyVol = vol10Daily * 0.35 + vol20Daily * 0.30 + vol60Daily * 0.20 + volFullDaily * 0.15;
+  const annualVol = blendedDailyVol * Math.sqrt(252);
+
+  // 변동성 비율 (현재 vs 평균) — UI 표시용
+  const volRatio = blendedDailyVol / volFullDaily;
+  const vol20Ann = vol20Daily * Math.sqrt(252) * 100;
+  const vol60Ann = vol60Daily * Math.sqrt(252) * 100;
+  const volFullAnn = volFullDaily * Math.sqrt(252) * 100;
+
+  const meanReturn = returns.reduce((a, b) => a + b, 0) / returns.length;
+
+  // SMA200 계산
+  const sma200Len = Math.min(200, prices.length);
+  const sma200Slice = prices.slice(-sma200Len);
+  const sma200 = sma200Slice.reduce((a, b) => a + b, 0) / sma200Slice.length;
+
+  // Guide Band 상태 판단
+  const sd200 = Math.sqrt(sma200Slice.reduce((a, p) => a + (p - sma200) ** 2, 0) / sma200Len);
+  const bandSigma = sd200 > 0 ? (currentPrice - sma200) / sd200 : 0;
+  let bandState = "중립";
+  if (bandSigma >= 2) bandState = "과열";
+  else if (bandSigma >= 1) bandState = "강세";
+  else if (bandSigma >= 0) bandState = "중립 상단";
+  else if (bandSigma >= -1) bandState = "중립 하단";
+  else if (bandSigma >= -2) bandState = "약세";
+  else bandState = "과매도";
+
+  // ── 방향성 지표 계산 ──
+  const emaCalc = (arr, len) => {
+    const k = 2 / (len + 1); const r = [arr[0]];
+    for (let i = 1; i < arr.length; i++) r.push(arr[i] * k + r[i - 1] * (1 - k));
+    return r;
+  };
+  const smaCalc = (arr, len) => {
+    const r = []; let s = 0;
+    for (let i = 0; i < arr.length; i++) {
+      s += arr[i]; if (i >= len) s -= arr[i - len];
+      r.push(i >= len - 1 ? s / len : null);
+    }
+    return r;
+  };
+
+  // 1) 추세 모멘텀: 5/10/20일 수익률 방향 (-1 ~ +1)
+  const mom5 = prices.length >= 6 ? (currentPrice / prices[prices.length - 6] - 1) : 0;
+  const mom10 = prices.length >= 11 ? (currentPrice / prices[prices.length - 11] - 1) : 0;
+  const mom20 = prices.length >= 21 ? (currentPrice / prices[prices.length - 21] - 1) : 0;
+  const momSignal = Math.tanh((mom5 * 3 + mom10 * 2 + mom20 * 1) / 6 * 30);
+
+  // 2) MA 배열: EMA5 > EMA20 > EMA60이면 +1, 역순이면 -1
+  const ema5 = emaCalc(prices, 5);
+  const ema20 = emaCalc(prices, 20);
+  const ema60 = emaCalc(prices, Math.min(60, prices.length - 1));
+  const e5Last = ema5[ema5.length - 1];
+  const e20Last = ema20[ema20.length - 1];
+  const e60Last = ema60[ema60.length - 1];
+  const maAlignScore = ((e5Last > e20Last ? 1 : -1) + (e20Last > e60Last ? 1 : -1) + (currentPrice > e20Last ? 1 : -1)) / 3;
+
+  // 3) RSI 14: >70이면 하방 편향, <30이면 상방 편향
+  const rsiLen = 14;
+  let gains = 0, losses = 0;
+  const rsiReturns = returns.slice(-rsiLen);
+  for (const r of rsiReturns) { if (r > 0) gains += r; else losses -= r; }
+  const avgGain = gains / rsiLen;
+  const avgLoss = losses / rsiLen;
+  const rsi = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  const rsiSignal = (50 - rsi) / 50;
+
+  // 4) MACD 히스토그램: 양수 → 상방, 음수 → 하방
+  const ema12 = emaCalc(prices, 12);
+  const ema26 = emaCalc(prices, 26);
+  const macdLine = ema12[ema12.length - 1] - ema26[ema26.length - 1];
+  const macdPrev = ema12.length >= 2 ? ema12[ema12.length - 2] - ema26[ema26.length - 2] : macdLine;
+  const macdNorm = currentPrice > 0 ? macdLine / currentPrice * 100 : 0;
+  const macdAccel = currentPrice > 0 ? (macdLine - macdPrev) / currentPrice * 100 : 0;
+  const macdSignal = Math.tanh((macdNorm * 2 + macdAccel * 5) * 10);
+
+  // 5) Guide Band 위치: 평균회귀 (과열→하방, 과매도→상방)
+  const bandDrift = -bandSigma * 0.25;
+
+  // 6) Cycle Phase: 확장기 → 상방, 수축기 → 하방
+  const re = cycleData?.re || 0;
+  const im = cycleData?.im || 0;
+  const phaseDrift = re * 0.4 + im * 0.3;
+
+  // 종합 방향성 점수 (-1 ~ +1) — Cycle Phase 제외 (재현성 확보: 과거 재계산 시 동일 결과)
+  const directionScore = (
+    momSignal    * 0.30 +
+    maAlignScore * 0.24 +
+    rsiSignal    * 0.12 +
+    macdSignal   * 0.18 +
+    bandDrift    * 0.16
+  );
+  const clampedDirection = Math.max(-1, Math.min(1, directionScore));
+  const adjustedDrift = meanReturn + clampedDirection * blendedDailyVol * 0.8;
+
+  // 시간대별 변동성 스케일링: 단기는 최근 변동성 비중↑, 장기는 평균 회귀
+  const getHorizonVol = (horizonDays) => {
+    if (horizonDays <= 1) return vol10Daily;
+    if (horizonDays <= 3) return vol10Daily * 0.6 + vol20Daily * 0.3 + vol60Daily * 0.1;
+    if (horizonDays <= 5) return vol20Daily * 0.5 + vol60Daily * 0.3 + volFullDaily * 0.2;
+    if (horizonDays <= 10) return vol20Daily * 0.3 + vol60Daily * 0.4 + volFullDaily * 0.3;
+    return vol60Daily * 0.4 + volFullDaily * 0.6;
+  };
+
+  // 확률 계산
+  const calcProb = (targetPct, horizonDays) => {
+    const hVol = getHorizonVol(horizonDays);
+    const vol = hVol * Math.sqrt(horizonDays);
+    const drift = adjustedDrift * horizonDays;
+    const targetReturn = Math.log(1 + targetPct / 100);
+    if (targetPct > 0) {
+      return (1 - normCDF((targetReturn - drift) / vol)) * 100;
+    } else {
+      return normCDF((targetReturn - drift) / vol) * 100;
+    }
+  };
+
+  // 셀 색상
+  const getCellColor = (prob, isUp) => {
+    if (prob < 1) return { bg: "var(--color-background-secondary)", text: "var(--color-text-tertiary)" };
+    if (isUp) {
+      if (prob >= 30) return { bg: "#0F6E56", text: "#fff" };
+      if (prob >= 15) return { bg: "#E1F5EE", text: "#0F6E56" };
+      if (prob >= 5)  return { bg: "#f0faf5", text: "#0F6E56" };
+      return { bg: "var(--color-background-secondary)", text: "#0F6E56" };
+    } else {
+      if (prob >= 30) return { bg: "#A32D2D", text: "#fff" };
+      if (prob >= 15) return { bg: "#FCEBEB", text: "#A32D2D" };
+      if (prob >= 5)  return { bg: "#fef5f5", text: "#A32D2D" };
+      return { bg: "var(--color-background-secondary)", text: "#A32D2D" };
+    }
+  };
+
+  const phaseInfo = PHASE[phase];
+  const bandColor = bandSigma >= 1 ? "#A32D2D" : bandSigma <= -1 ? "#185FA5" : "#0F6E56";
+  const volStateLabel = volRatio >= 1.5 ? "매우 높음" : volRatio >= 1.2 ? "높음" : volRatio >= 0.8 ? "보통" : "낮음";
+  const volStateColor = volRatio >= 1.5 ? "#A32D2D" : volRatio >= 1.2 ? "#854F0B" : "#0F6E56";
+
+  return (
+    <div>
+      {/* 상단 요약 */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 8, marginBottom: 16 }}>
+        <div style={{ padding: "10px 12px", borderRadius: 8, background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)" }}>
+          <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>현재가 ({label})</div>
+          <div style={{ fontSize: 20, fontWeight: 600, color: "var(--color-text-primary)" }}>
+            {hasRealData ? (currentPrice >= 1000 ? Math.round(currentPrice).toLocaleString() : currentPrice.toFixed(2)) : "—"}
+          </div>
+        </div>
+        <div style={{ padding: "10px 12px", borderRadius: 8, background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)" }}>
+          <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>적용 변동성 (가중)</div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+            <span style={{ fontSize: 20, fontWeight: 600, color: "var(--color-text-primary)" }}>{(annualVol * 100).toFixed(1)}%</span>
+            <span style={{ fontSize: 11, fontWeight: 600, color: volStateColor, padding: "1px 6px", borderRadius: 4, background: volStateColor + "18" }}>{volStateLabel}</span>
+          </div>
+          <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>20일 {vol20Ann.toFixed(1)}% / 60일 {vol60Ann.toFixed(1)}% / 평균 {volFullAnn.toFixed(1)}%</div>
+          {volRatio >= 1.2 && <div style={{ fontSize: 10, color: volStateColor, marginTop: 2 }}>⚡ 최근 변동성이 평균 대비 {((volRatio - 1) * 100).toFixed(0)}% 높음</div>}
+          {volRatio < 0.8 && <div style={{ fontSize: 10, color: volStateColor, marginTop: 2 }}>😴 최근 변동성이 평균 대비 {((1 - volRatio) * 100).toFixed(0)}% 낮음</div>}
+        </div>
+        <div style={{ padding: "10px 12px", borderRadius: 8, background: "var(--color-background-secondary)", border: `0.5px solid var(--color-border-tertiary)` }}>
+          <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>Guide Band 위치</div>
+          <div style={{ fontSize: 16, fontWeight: 600, color: bandColor }}>{bandState}</div>
+          <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{bandSigma >= 0 ? "+" : ""}{bandSigma.toFixed(2)}σ (SMA200 대비)</div>
+        </div>
+        <div style={{ padding: "10px 12px", borderRadius: 8, background: phaseInfo.bg, border: `0.5px solid ${phaseInfo.color}40` }}>
+          <div style={{ fontSize: 11, color: phaseInfo.color }}>Cycle Phase</div>
+          <div style={{ fontSize: 16, fontWeight: 600, color: phaseInfo.color }}>{phaseInfo.icon} {phaseInfo.label}</div>
+          <div style={{ fontSize: 10, color: phaseInfo.color, opacity: 0.8 }}>{phaseInfo.tip}</div>
+        </div>
+        {(() => {
+          const dirPct = Math.round(clampedDirection * 100);
+          const dirColor = dirPct >= 20 ? "#0F6E56" : dirPct >= 5 ? "#4caf50" : dirPct <= -20 ? "#A32D2D" : dirPct <= -5 ? "#e57373" : "#854F0B";
+          const dirLabel = dirPct >= 30 ? "강한 상방" : dirPct >= 15 ? "상방 우세" : dirPct >= 5 ? "약한 상방" : dirPct <= -30 ? "강한 하방" : dirPct <= -15 ? "하방 우세" : dirPct <= -5 ? "약한 하방" : "중립";
+          const dirArrow = dirPct >= 5 ? "▲" : dirPct <= -5 ? "▼" : "●";
+          const details = [
+            { name: "모멘텀", val: momSignal },
+            { name: "MA배열", val: maAlignScore },
+            { name: "RSI", val: rsiSignal },
+            { name: "MACD", val: macdSignal },
+            { name: "밴드", val: Math.max(-1, Math.min(1, bandDrift)) },
+            { name: "국면(참고)", val: Math.max(-1, Math.min(1, phaseDrift)) },
+          ];
+          return (
+            <div style={{ padding: "10px 12px", borderRadius: 8, background: "var(--color-background-secondary)", border: `1.5px solid ${dirColor}40` }}>
+              <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>방향성 판단</div>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                <span style={{ fontSize: 18, fontWeight: 600, color: dirColor }}>{dirArrow} {dirLabel}</span>
+                <span style={{ fontSize: 12, color: dirColor }}>{dirPct >= 0 ? "+" : ""}{dirPct}%</span>
+              </div>
+              <div style={{ display: "flex", gap: 3, marginTop: 6, flexWrap: "wrap" }}>
+                {details.map(d => {
+                  const c = d.val > 0.1 ? "#0F6E56" : d.val < -0.1 ? "#A32D2D" : "var(--color-text-tertiary)";
+                  const arrow = d.val > 0.1 ? "↑" : d.val < -0.1 ? "↓" : "·";
+                  return (
+                    <span key={d.name} style={{ fontSize: 9, color: c, padding: "1px 4px", borderRadius: 3, background: c === "var(--color-text-tertiary)" ? "transparent" : c + "12", border: `0.5px solid ${c}30` }}>
+                      {arrow}{d.name}
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
+      </div>
+
+      {/* 확률 매트릭스 */}
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 2, fontSize: 12 }}>
+          <thead>
+            <tr>
+              <th style={{ padding: "8px 6px", fontSize: 11, color: "var(--color-text-tertiary)", fontWeight: 500, textAlign: "left", minWidth: 100 }}>
+                가격 수준
+              </th>
+              {HORIZONS.map(h => (
+                <th key={h.label} style={{ padding: "8px 6px", fontSize: 11, color: "var(--color-text-tertiary)", fontWeight: 500, textAlign: "center", minWidth: 70 }}>
+                  {h.label}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {/* 상승 구간 (25% → 5%) */}
+            {LEVELS.map(pct => {
+              const targetPrice = currentPrice * (1 + pct / 100);
+              return (
+                <tr key={`up-${pct}`}>
+                  <td style={{ padding: "6px 8px", borderRadius: 4, fontSize: 11, fontWeight: 500, color: "#0F6E56", background: "var(--color-background-secondary)" }}>
+                    <span>▲ +{pct}%</span>
+                    <span style={{ marginLeft: 6, fontSize: 10, color: "var(--color-text-tertiary)", fontWeight: 400 }}>
+                      {targetPrice >= 1000 ? Math.round(targetPrice).toLocaleString() : targetPrice.toFixed(1)}
+                    </span>
+                  </td>
+                  {HORIZONS.map(h => {
+                    const prob = calcProb(pct, h.days);
+                    const style = getCellColor(prob, true);
+                    return (
+                      <td key={h.label} style={{
+                        padding: "6px 4px", borderRadius: 4, textAlign: "center",
+                        fontWeight: prob >= 10 ? 600 : 400,
+                        background: style.bg, color: style.text,
+                        transition: "all 0.2s",
+                      }}>
+                        {prob < 0.1 ? "—" : prob.toFixed(1) + "%"}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+
+            {/* 현재가 행 */}
+            <tr>
+              <td colSpan={HORIZONS.length + 1} style={{
+                padding: "4px 8px", fontSize: 11, fontWeight: 600,
+                background: "var(--color-text-primary)", color: "var(--color-background-primary)",
+                borderRadius: 4, textAlign: "center",
+              }}>
+                ● 현재가 {hasRealData ? (currentPrice >= 1000 ? Math.round(currentPrice).toLocaleString() : currentPrice.toFixed(2)) : "—"}
+              </td>
+            </tr>
+
+            {/* 하락 구간 (-5% → -25%) */}
+            {LEVELS.slice().reverse().map(pct => {
+              const targetPrice = currentPrice * (1 - pct / 100);
+              return (
+                <tr key={`down-${pct}`}>
+                  <td style={{ padding: "6px 8px", borderRadius: 4, fontSize: 11, fontWeight: 500, color: "#A32D2D", background: "var(--color-background-secondary)" }}>
+                    <span>▼ -{pct}%</span>
+                    <span style={{ marginLeft: 6, fontSize: 10, color: "var(--color-text-tertiary)", fontWeight: 400 }}>
+                      {targetPrice >= 1000 ? Math.round(targetPrice).toLocaleString() : targetPrice.toFixed(1)}
+                    </span>
+                  </td>
+                  {HORIZONS.map(h => {
+                    const prob = calcProb(-pct, h.days);
+                    const style = getCellColor(prob, false);
+                    return (
+                      <td key={h.label} style={{
+                        padding: "6px 4px", borderRadius: 4, textAlign: "center",
+                        fontWeight: prob >= 10 ? 600 : 400,
+                        background: style.bg, color: style.text,
+                        transition: "all 0.2s",
+                      }}>
+                        {prob < 0.1 ? "—" : prob.toFixed(1) + "%"}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* ─── 과거 예측 정확도 ─── */}
+      <div style={{ marginTop: 12, padding: "10px 14px", borderRadius: 10, background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: "var(--color-text-primary)" }}>과거 예측 정확도</span>
+          {[5, 20].map(n => {
+            const isActive = retroMode === n;
+            return (
+              <button
+                key={n}
+                onClick={() => {
+                  if (isActive) { setRetroMode(null); setRetroData(null); return; }
+                  setRetroMode(n);
+                  setRetroLoading(true);
+                  setTimeout(() => {
+                    setRetroData(computeRetroMatrices(prices, dates, n));
+                    setRetroLoading(false);
+                  }, 30);
+                }}
+                disabled={retroLoading}
+                style={{
+                  fontSize: 11, padding: "4px 12px", cursor: retroLoading ? "wait" : "pointer",
+                  fontWeight: isActive ? 600 : 400,
+                  background: isActive ? "var(--color-text-primary)" : "var(--color-background-primary)",
+                  color: isActive ? "var(--color-background-primary)" : "var(--color-text-secondary)",
+                  border: "0.5px solid var(--color-border-tertiary)", borderRadius: 6,
+                }}
+              >
+                과거 {n}일
+              </button>
+            );
+          })}
+          {retroLoading && <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>계산 중...</span>}
+          {!retroMode && !retroLoading && (
+            <span style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>
+              과거 날짜별 예측 매트릭스와 실제 결과를 비교합니다
+            </span>
+          )}
+        </div>
+
+        {retroData && retroMode && (
+          <div style={{ marginTop: 12 }}>
+            {retroData.map((day, idx) => {
+              const dirPct = Math.round(day.direction * 100);
+              const dirLabel = dirPct >= 15 ? "상방" : dirPct <= -15 ? "하방" : "중립";
+              const dirColor = dirPct >= 5 ? "#0F6E56" : dirPct <= -5 ? "#A32D2D" : "#854F0B";
+              return (
+                <div key={idx} style={{
+                  marginBottom: 10, padding: "10px 12px", borderRadius: 8,
+                  background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)",
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: "var(--color-text-primary)" }}>
+                      {day.date}
+                    </span>
+                    <span style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>
+                      기준가 {day.basePrice >= 1000 ? Math.round(day.basePrice).toLocaleString() : day.basePrice.toFixed(2)}
+                    </span>
+                    <span style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>
+                      변동성 {day.annualVol.toFixed(1)}%
+                    </span>
+                    <span style={{ fontSize: 10, fontWeight: 600, color: dirColor, padding: "1px 6px", borderRadius: 4, background: dirColor + "15" }}>
+                      {dirLabel} {dirPct >= 0 ? "+" : ""}{dirPct}%
+                    </span>
+                  </div>
+
+                  {/* 실제 결과 vs 예측 */}
+                  <div style={{ display: "flex", gap: 4, marginBottom: 8, flexWrap: "wrap" }}>
+                    {HORIZONS.map(h => {
+                      const actual = day.actuals[h.label];
+                      if (actual == null) return (
+                        <div key={h.label} style={{ flex: 1, minWidth: 65, textAlign: "center", padding: "4px 6px", borderRadius: 5, background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)" }}>
+                          <div style={{ fontSize: 9, color: "var(--color-text-tertiary)" }}>{h.label} 후</div>
+                          <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>미래</div>
+                        </div>
+                      );
+                      const c = actual >= 0 ? "#0F6E56" : "#A32D2D";
+                      const arrow = actual >= 0 ? "▲" : "▼";
+                      return (
+                        <div key={h.label} style={{ flex: 1, minWidth: 65, textAlign: "center", padding: "4px 6px", borderRadius: 5, background: c + "08", border: `0.5px solid ${c}30` }}>
+                          <div style={{ fontSize: 9, color: "var(--color-text-tertiary)" }}>{h.label} 후 실제</div>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: c }}>{arrow} {actual >= 0 ? "+" : ""}{actual.toFixed(2)}%</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* 축소된 확률 매트릭스 */}
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 1, fontSize: 10 }}>
+                      <thead>
+                        <tr>
+                          <th style={{ padding: "4px 4px", fontSize: 9, color: "var(--color-text-tertiary)", fontWeight: 500, textAlign: "left", minWidth: 70 }}>수준</th>
+                          {HORIZONS.map(h => (
+                            <th key={h.label} style={{ padding: "4px 3px", fontSize: 9, color: "var(--color-text-tertiary)", fontWeight: 500, textAlign: "center", minWidth: 50 }}>
+                              {h.label}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {LEVELS.map(pct => (
+                          <tr key={`up-${pct}`}>
+                            <td style={{ padding: "3px 4px", borderRadius: 3, fontSize: 9, fontWeight: 500, color: "#0F6E56", background: "var(--color-background-secondary)" }}>▲+{pct}%</td>
+                            {HORIZONS.map(h => {
+                              const prob = day.matrix[h.label][pct].up;
+                              const actual = day.actuals[h.label];
+                              const hit = actual != null && actual >= pct;
+                              const style = getCellColor(prob, true);
+                              return (
+                                <td key={h.label} style={{
+                                  padding: "3px 2px", borderRadius: 3, textAlign: "center",
+                                  fontWeight: prob >= 10 ? 600 : 400,
+                                  background: hit ? "#0F6E56" : style.bg, color: hit ? "#fff" : style.text,
+                                  outline: hit ? "2px solid #0F6E56" : "none",
+                                }}>
+                                  {prob < 0.1 ? "—" : prob.toFixed(1) + "%"}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                        <tr>
+                          <td colSpan={HORIZONS.length + 1} style={{
+                            padding: "2px 4px", fontSize: 9, fontWeight: 600,
+                            background: "var(--color-text-primary)", color: "var(--color-background-primary)",
+                            borderRadius: 3, textAlign: "center",
+                          }}>
+                            ● {day.basePrice >= 1000 ? Math.round(day.basePrice).toLocaleString() : day.basePrice.toFixed(2)}
+                          </td>
+                        </tr>
+                        {LEVELS.slice().reverse().map(pct => (
+                          <tr key={`dn-${pct}`}>
+                            <td style={{ padding: "3px 4px", borderRadius: 3, fontSize: 9, fontWeight: 500, color: "#A32D2D", background: "var(--color-background-secondary)" }}>▼-{pct}%</td>
+                            {HORIZONS.map(h => {
+                              const prob = day.matrix[h.label][pct].down;
+                              const actual = day.actuals[h.label];
+                              const hit = actual != null && actual <= -pct;
+                              const style = getCellColor(prob, false);
+                              return (
+                                <td key={h.label} style={{
+                                  padding: "3px 2px", borderRadius: 3, textAlign: "center",
+                                  fontWeight: prob >= 10 ? 600 : 400,
+                                  background: hit ? "#A32D2D" : style.bg, color: hit ? "#fff" : style.text,
+                                  outline: hit ? "2px solid #A32D2D" : "none",
+                                }}>
+                                  {prob < 0.1 ? "—" : prob.toFixed(1) + "%"}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })}
+
+            {/* 요약 통계 */}
+            {(() => {
+              let totalChecks = 0, correctHits = 0;
+              for (const day of retroData) {
+                for (const h of HORIZONS) {
+                  const actual = day.actuals[h.label];
+                  if (actual == null) continue;
+                  const predicted = day.direction >= 0 ? "up" : "down";
+                  const happened = actual >= 0 ? "up" : "down";
+                  totalChecks++;
+                  if (predicted === happened) correctHits++;
+                }
+              }
+              const dirAcc = totalChecks > 0 ? (correctHits / totalChecks * 100) : 0;
+              const dirColor = dirAcc >= 55 ? "#0F6E56" : dirAcc >= 50 ? "#854F0B" : "#A32D2D";
+
+              let probAcc5 = { total: 0, correct: 0 };
+              let probAcc10 = { total: 0, correct: 0 };
+              for (const day of retroData) {
+                for (const h of HORIZONS) {
+                  const actual = day.actuals[h.label];
+                  if (actual == null) continue;
+                  const prob5up = day.matrix[h.label][5].up;
+                  const prob5dn = day.matrix[h.label][5].down;
+                  if (prob5up >= 50) { probAcc5.total++; if (actual >= 5) probAcc5.correct++; }
+                  if (prob5dn >= 50) { probAcc5.total++; if (actual <= -5) probAcc5.correct++; }
+                  const prob10up = day.matrix[h.label][10].up;
+                  const prob10dn = day.matrix[h.label][10].down;
+                  if (prob10up >= 30) { probAcc10.total++; if (actual >= 10) probAcc10.correct++; }
+                  if (prob10dn >= 30) { probAcc10.total++; if (actual <= -10) probAcc10.correct++; }
+                }
+              }
+
+              return (
+                <div style={{
+                  padding: "8px 10px", borderRadius: 6, background: "var(--color-background-primary)",
+                  border: "0.5px solid var(--color-border-tertiary)", marginTop: 4,
+                }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "var(--color-text-primary)", marginBottom: 6 }}>최근 {retroMode}일 요약</div>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <div style={{ padding: "4px 8px", borderRadius: 5, background: dirColor + "10", border: `0.5px solid ${dirColor}30` }}>
+                      <div style={{ fontSize: 9, color: "var(--color-text-tertiary)" }}>방향 적중률</div>
+                      <div style={{ fontSize: 14, fontWeight: 600, color: dirColor }}>{dirAcc.toFixed(1)}%</div>
+                      <div style={{ fontSize: 9, color: "var(--color-text-tertiary)" }}>{correctHits}/{totalChecks}건</div>
+                    </div>
+                    {probAcc5.total > 0 && (
+                      <div style={{ padding: "4px 8px", borderRadius: 5, background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)" }}>
+                        <div style={{ fontSize: 9, color: "var(--color-text-tertiary)" }}>±5% 예측 ({">"}50%일 때)</div>
+                        <div style={{ fontSize: 14, fontWeight: 600, color: "var(--color-text-primary)" }}>{probAcc5.correct}/{probAcc5.total}</div>
+                      </div>
+                    )}
+                    {probAcc10.total > 0 && (
+                      <div style={{ padding: "4px 8px", borderRadius: 5, background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)" }}>
+                        <div style={{ fontSize: 9, color: "var(--color-text-tertiary)" }}>±10% 예측 ({">"}30%일 때)</div>
+                        <div style={{ fontSize: 14, fontWeight: 600, color: "var(--color-text-primary)" }}>{probAcc10.correct}/{probAcc10.total}</div>
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 9, color: "var(--color-text-tertiary)", marginTop: 6, lineHeight: 1.5 }}>
+                    각 매트릭스는 해당 날짜까지의 가격 데이터만으로 재계산한 값입니다. 실제 결과에 해당하는 셀은 강조 표시됩니다.
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        )}
+      </div>
+
+      {/* ─── 변동성 전망 ─── */}
+      {(() => {
+        // Signal 1: Bollinger Band 스퀴즈 (밴드 폭 축소 → 확대 임박)
+        const bandWidths = [];
+        for (let i = 19; i < prices.length; i++) {
+          const slice = prices.slice(i - 19, i + 1);
+          const m = slice.reduce((a, b) => a + b, 0) / 20;
+          const sd = Math.sqrt(slice.reduce((a, p) => a + (p - m) ** 2, 0) / 20);
+          bandWidths.push(sd / m);
+        }
+        const currentBW = bandWidths[bandWidths.length - 1];
+        const sortedBW = [...bandWidths].sort((a, b) => a - b);
+        const bwPercentile = sortedBW.findIndex(v => v >= currentBW) / sortedBW.length;
+        const squeezeScore = Math.round((1 - bwPercentile) * 100);
+        const squeezeLabel = bwPercentile <= 0.1 ? "극단적 수축" : bwPercentile <= 0.25 ? "수축 구간" : bwPercentile <= 0.5 ? "보통" : bwPercentile <= 0.75 ? "확장 중" : "고변동 구간";
+
+        // Signal 2: VIX 수준
+        const vix = cycleData?.vix;
+        let vixScore = 30;
+        let vixLabel = "데이터 없음";
+        if (vix != null) {
+          if (vix >= 30) { vixScore = 95; vixLabel = `${vix.toFixed(1)} — 극단적 공포`; }
+          else if (vix >= 25) { vixScore = 75; vixLabel = `${vix.toFixed(1)} — 높은 공포`; }
+          else if (vix >= 20) { vixScore = 55; vixLabel = `${vix.toFixed(1)} — 경계`; }
+          else if (vix >= 15) { vixScore = 30; vixLabel = `${vix.toFixed(1)} — 보통`; }
+          else { vixScore = 10; vixLabel = `${vix.toFixed(1)} — 안정`; }
+        }
+
+        // Signal 3: 변동성 가속도 (5일 vol vs 20일 vol 비율)
+        const vol5 = returns.length >= 5 ? calcVol(returns.slice(-5)) : vol10Daily;
+        const accelRatio = vol5 / vol60Daily;
+        const accelScore = Math.min(100, Math.round(Math.max(0, (accelRatio - 0.5) / 2.5 * 100)));
+        const accelLabel = accelRatio >= 2.0 ? "급격한 상승" : accelRatio >= 1.5 ? "상승 추세" : accelRatio >= 1.0 ? "보통" : accelRatio >= 0.7 ? "하락 추세" : "매우 낮음";
+
+        // Signal 4: 주요 MA 근접도 (SMA200 근처 = 결정 구간)
+        const distFromMA = Math.abs(currentPrice - sma200) / sma200 * 100;
+        const maScore = distFromMA <= 1 ? 90 : distFromMA <= 2 ? 70 : distFromMA <= 5 ? 45 : distFromMA <= 10 ? 25 : 10;
+        const maLabel = distFromMA <= 1 ? `SMA200까지 ${distFromMA.toFixed(1)}% — 결정적 구간` : distFromMA <= 3 ? `SMA200까지 ${distFromMA.toFixed(1)}% — 근접` : `SMA200까지 ${distFromMA.toFixed(1)}%`;
+
+        // Signal 5: 변동성 군집 (최근 고변동 지속 여부)
+        const highVolDays = returns.slice(-20).filter(r => Math.abs(r) > volFullDaily * 1.5).length;
+        const clusterScore = Math.min(100, Math.round(highVolDays / 20 * 250));
+        const clusterLabel = highVolDays >= 8 ? `20일 중 ${highVolDays}일 이상치 — 강한 군집` : highVolDays >= 4 ? `20일 중 ${highVolDays}일 이상치` : `20일 중 ${highVolDays}일 이상치 — 안정`;
+
+        // Signal 6: Cycle Phase 전환 근접도
+        const reAbs = Math.abs(cycleData?.re || 0);
+        const imAbs = Math.abs(cycleData?.im || 0);
+        const transitionDist = Math.min(reAbs, imAbs);
+        const transScore = transitionDist <= 0.05 ? 85 : transitionDist <= 0.1 ? 65 : transitionDist <= 0.2 ? 40 : 15;
+        const transLabel = transitionDist <= 0.05 ? "국면 전환 임박" : transitionDist <= 0.1 ? "전환 근접" : transitionDist <= 0.2 ? "전환 가능" : "안정적 국면";
+
+        const signals = [
+          { name: "밴드 스퀴즈", score: squeezeScore, detail: squeezeLabel, weight: 25, desc: "밴드 폭 축소 시 확대 임박" },
+          { name: "VIX 공포지수", score: vixScore, detail: vixLabel, weight: 20, desc: "시장 공포 수준" },
+          { name: "변동성 가속도", score: accelScore, detail: accelLabel, weight: 20, desc: "5일/60일 변동성 비율" },
+          { name: "MA 근접도", score: maScore, detail: maLabel, weight: 15, desc: "SMA200 근처에서 방향 결정" },
+          { name: "변동성 군집", score: clusterScore, detail: clusterLabel, weight: 10, desc: "최근 큰 변동 빈도" },
+          { name: "국면 전환", score: transScore, detail: transLabel, weight: 10, desc: "Cycle Phase 경계 근접" },
+        ];
+
+        const totalScore = Math.round(signals.reduce((a, s) => a + s.score * s.weight, 0) / 100);
+        const totalColor = totalScore >= 70 ? "#A32D2D" : totalScore >= 50 ? "#854F0B" : totalScore >= 30 ? "#185FA5" : "#0F6E56";
+        const totalLabel = totalScore >= 70 ? "높음" : totalScore >= 50 ? "주의" : totalScore >= 30 ? "보통" : "낮음";
+        const totalTip = totalScore >= 70
+          ? "변동성 확대 가능성이 높습니다. 포지션 크기를 줄이거나 헤지를 고려하세요."
+          : totalScore >= 50
+          ? "일부 경고 신호가 감지됩니다. 시장 상황을 주의 깊게 모니터링하세요."
+          : totalScore >= 30
+          ? "변동성이 비교적 안정적입니다. 정상적인 시장 상태입니다."
+          : "변동성이 낮은 구간입니다. 밴드 스퀴즈 여부를 확인하세요.";
+
+        return (
+          <div style={{ marginTop: 16, padding: "14px 14px", borderRadius: 10, border: `1.5px solid ${totalColor}30`, background: `${totalColor}08` }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: "var(--color-text-primary)" }}>변동성 전망</div>
+              <div style={{
+                padding: "3px 10px", borderRadius: 6, fontSize: 12, fontWeight: 600,
+                color: totalColor, background: totalColor + "18",
+              }}>
+                {totalScore}점 — {totalLabel}
+              </div>
+              <div style={{
+                flex: 1, height: 6, borderRadius: 3, background: "var(--color-border-tertiary)",
+                overflow: "hidden",
+              }}>
+                <div style={{
+                  height: "100%", borderRadius: 3, background: totalColor,
+                  width: `${totalScore}%`, transition: "width 0.5s ease",
+                }} />
+              </div>
+            </div>
+
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 12, lineHeight: 1.5 }}>
+              {totalTip}
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 6 }}>
+              {signals.map(s => {
+                const c = s.score >= 70 ? "#A32D2D" : s.score >= 50 ? "#854F0B" : s.score >= 30 ? "#185FA5" : "#0F6E56";
+                return (
+                  <div key={s.name} style={{
+                    padding: "8px 10px", borderRadius: 6,
+                    background: "var(--color-background-primary)",
+                    border: "0.5px solid var(--color-border-tertiary)",
+                  }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                      <span style={{ fontSize: 11, fontWeight: 600, color: "var(--color-text-primary)" }}>{s.name}</span>
+                      <span style={{ fontSize: 10, fontWeight: 600, color: c, padding: "1px 5px", borderRadius: 3, background: c + "15" }}>{s.score}</span>
+                    </div>
+                    <div style={{ height: 3, borderRadius: 2, background: "var(--color-border-tertiary)", marginBottom: 4 }}>
+                      <div style={{ height: "100%", borderRadius: 2, background: c, width: `${s.score}%` }} />
+                    </div>
+                    <div style={{ fontSize: 10, color: "var(--color-text-secondary)" }}>{s.detail}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ─── 모델 검증 (백테스트) ─── */}
+      <div style={{ marginTop: 16, padding: "14px", borderRadius: 10, background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: btResults ? 12 : 0 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: "var(--color-text-primary)" }}>모델 검증</div>
+          <button
+            onClick={() => {
+              setBtRunning(true);
+              setBtResults(null);
+              setTimeout(() => {
+                const r = runBacktest(prices);
+                setBtResults(r);
+                setBtRunning(false);
+              }, 50);
+            }}
+            disabled={btRunning}
+            style={{ fontSize: 11, padding: "4px 12px", cursor: btRunning ? "wait" : "pointer" }}
+          >
+            {btRunning ? "분석 중..." : btResults ? "재검증" : "백테스트 실행"}
+          </button>
+          {!btResults && !btRunning && (
+            <span style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>
+              과거 데이터로 모델 정확도를 검증합니다
+            </span>
+          )}
+        </div>
+
+        {btResults && (
+          <div>
+            {/* 요약 카드 */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 8, marginBottom: 12 }}>
+              <div style={{ padding: "8px 10px", borderRadius: 6, background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)" }}>
+                <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>검증 기간</div>
+                <div style={{ fontSize: 16, fontWeight: 600, color: "var(--color-text-primary)" }}>{btResults.testDays}일</div>
+              </div>
+              {(() => {
+                const acc = btResults.dirAccuracy;
+                const c = acc >= 55 ? "#0F6E56" : acc >= 50 ? "#854F0B" : "#A32D2D";
+                return (
+                  <div style={{ padding: "8px 10px", borderRadius: 6, background: "var(--color-background-primary)", border: `1px solid ${c}30` }}>
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>방향 적중률</div>
+                    <div style={{ fontSize: 16, fontWeight: 600, color: c }}>{acc.toFixed(1)}%</div>
+                    <div style={{ fontSize: 9, color: "var(--color-text-tertiary)" }}>{btResults.dirTotal}건 판단</div>
+                  </div>
+                );
+              })()}
+              {(() => {
+                const bs = btResults.brierScore;
+                const c = bs <= 0.05 ? "#0F6E56" : bs <= 0.15 ? "#854F0B" : "#A32D2D";
+                const lbl = bs <= 0.05 ? "우수" : bs <= 0.10 ? "양호" : bs <= 0.15 ? "보통" : "개선 필요";
+                return (
+                  <div style={{ padding: "8px 10px", borderRadius: 6, background: "var(--color-background-primary)", border: `1px solid ${c}30` }}>
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>Brier Score</div>
+                    <div style={{ fontSize: 16, fontWeight: 600, color: c }}>{bs.toFixed(4)}</div>
+                    <div style={{ fontSize: 9, color: c }}>{lbl} (0에 가까울수록 정확)</div>
+                  </div>
+                );
+              })()}
+              {(() => {
+                const ce = btResults.calError;
+                const c = ce <= 3 ? "#0F6E56" : ce <= 6 ? "#854F0B" : "#A32D2D";
+                return (
+                  <div style={{ padding: "8px 10px", borderRadius: 6, background: "var(--color-background-primary)", border: `1px solid ${c}30` }}>
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>보정 오차 (ECE)</div>
+                    <div style={{ fontSize: 16, fontWeight: 600, color: c }}>{ce.toFixed(1)}%p</div>
+                    <div style={{ fontSize: 9, color: c }}>예측확률 vs 실제빈도 차이</div>
+                  </div>
+                );
+              })()}
+            </div>
+
+            {/* 시간대별 방향 적중률 */}
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: "var(--color-text-primary)", marginBottom: 6 }}>시간대별 방향 적중률</div>
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                {btResults.dirByHorizon.map(h => {
+                  const c = h.accuracy >= 55 ? "#0F6E56" : h.accuracy >= 50 ? "#854F0B" : "#A32D2D";
+                  return (
+                    <div key={h.label} style={{
+                      flex: 1, minWidth: 80, padding: "6px 8px", borderRadius: 6, textAlign: "center",
+                      background: "var(--color-background-primary)", border: `1px solid ${c}30`,
+                    }}>
+                      <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{h.label}</div>
+                      <div style={{ fontSize: 14, fontWeight: 600, color: c }}>{h.accuracy.toFixed(1)}%</div>
+                      <div style={{ fontSize: 9, color: "var(--color-text-tertiary)" }}>{h.count}건</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* 확률 보정 차트 */}
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 600, color: "var(--color-text-primary)", marginBottom: 6 }}>확률 보정 (Calibration)</div>
+              <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginBottom: 8 }}>
+                예측 확률 구간별 실제 발생 빈도 — 대각선에 가까울수록 보정이 정확
+              </div>
+              <div style={{ display: "flex", gap: 2, alignItems: "flex-end", height: 100, padding: "0 4px" }}>
+                {btResults.calibration.map((cal, i) => {
+                  const ideal = cal.avgPredicted;
+                  const actual = cal.avgActual;
+                  const diff = Math.abs(actual - ideal);
+                  const c = diff <= 3 ? "#0F6E56" : diff <= 8 ? "#854F0B" : "#A32D2D";
+                  const maxH = 100;
+                  return (
+                    <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+                      <div style={{ width: "100%", display: "flex", gap: 1, alignItems: "flex-end", justifyContent: "center", height: maxH }}>
+                        <div title={`예측: ${ideal.toFixed(1)}%`}
+                          style={{ width: 8, height: Math.max(2, ideal / 50 * maxH), background: "var(--color-border-tertiary)", borderRadius: 2 }} />
+                        <div title={`실제: ${actual.toFixed(1)}%`}
+                          style={{ width: 8, height: Math.max(2, actual / 50 * maxH), background: c, borderRadius: 2 }} />
+                      </div>
+                      <div style={{ fontSize: 8, color: "var(--color-text-tertiary)", whiteSpace: "nowrap" }}>{cal.bucket}</div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ display: "flex", gap: 12, marginTop: 6, justifyContent: "center" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 9, color: "var(--color-text-tertiary)" }}>
+                  <div style={{ width: 8, height: 8, background: "var(--color-border-tertiary)", borderRadius: 2 }} /> 예측 확률
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 9, color: "var(--color-text-tertiary)" }}>
+                  <div style={{ width: 8, height: 8, background: "#0F6E56", borderRadius: 2 }} /> 실제 빈도
+                </div>
+              </div>
+            </div>
+
+            {/* 해석 */}
+            <div style={{ marginTop: 10, padding: "8px 10px", borderRadius: 6, background: "var(--color-background-primary)", fontSize: 10, color: "var(--color-text-secondary)", lineHeight: 1.6 }}>
+              <span style={{ fontWeight: 600, color: "var(--color-text-primary)" }}>해석: </span>
+              {btResults.dirAccuracy >= 55
+                ? "방향 예측이 유의미한 수준입니다. 모멘텀/추세 지표가 과거 데이터에서 유효했습니다."
+                : btResults.dirAccuracy >= 50
+                ? "방향 예측이 동전 던지기 수준입니다. 방향성보다 변동성(크기) 예측에 더 무게를 두세요."
+                : "방향 예측이 50% 미만입니다. 역추세(mean-reversion) 전략이 더 적합한 데이터입니다."}
+              {" "}Brier Score {btResults.brierScore.toFixed(4)}는 {btResults.brierScore <= 0.05 ? "확률 추정이 정확함을" : btResults.brierScore <= 0.15 ? "확률 추정이 합리적 수준임을" : "확률 추정의 개선이 필요함을"} 나타냅니다.
+              {" "}(VIX·Cycle Phase 데이터는 현재 시점만 존재하여 백테스트에서 제외)
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* 하단 설명 */}
+      <div style={{ marginTop: 12, padding: "10px 12px", borderRadius: 8, background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)" }}>
+        <div style={{ fontSize: 11, color: "var(--color-text-secondary)", lineHeight: 1.6 }}>
+          <span style={{ fontWeight: 500, color: "var(--color-text-primary)" }}>산출 방식: </span>
+          가중 변동성 모델 (10일 35% + 20일 30% + 60일 20% + 전체 15%) · 시간대별 변동성 스케일링 (단기→최근 비중↑, 장기→평균 회귀) · 5개 기술지표 방향성 편향 (모멘텀·MA배열·RSI·MACD·밴드위치)
+        </div>
+        <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 4 }}>
+          ※ 통계적 추정이며 투자 조언이 아닙니다. 과거 변동성 기반이므로 급변하는 시장 상황은 반영되지 않습니다.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ─── LOADING PROGRESS ─── */
 function LoadingProgress({ message }) {
   return (
@@ -1204,7 +2360,7 @@ export default function IntegratedMonitor() {
         ((3.5 - (m.us10y || 4)) / 3) * 0.3 +
         ((1300 - (m.usdkrw || 1350)) / 200) * 0.3
       );
-      setCycleData({ re, im });
+      setCycleData({ re, im, vix: m.vix || null, usdkrw: m.usdkrw || null, us10y: m.us10y || null });
       setLastUpdated(new Date());
       setHasRealData(true);
       setStatusMsg(`Updated ${new Date().toLocaleTimeString()}`);
@@ -1449,6 +2605,18 @@ export default function IntegratedMonitor() {
             {lastIR > 1 && lastIR < 1.02 && " IR just crossed 1.0 — critical juncture. Watch for confirmation."}
           </div>
         </div>
+      )}
+
+      {/* ─── Scenario Tab ─── */}
+      {activeTab === "scenario" && (
+        <ScenarioMatrix
+          prices={currentPrices}
+          dates={currentDates}
+          phase={phase}
+          cycleData={cycleData}
+          label={activeSymbol}
+          hasRealData={hasRealData}
+        />
       )}
 
       {/* ─── Short-term Recommendations Tab ─── */}
