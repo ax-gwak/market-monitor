@@ -1036,7 +1036,7 @@ function computeRetroMatrices(allPrices, allDates, numDays) {
 }
 
 /* ─── SCENARIO MATRIX ─── */
-function ScenarioMatrix({ prices, dates, phase, cycleData, label, hasRealData }) {
+function ScenarioMatrix({ prices, dates, phase, cycleData, label, hasRealData, marketPrice }) {
   const [btResults, setBtResults] = useState(null);
   const [btRunning, setBtRunning] = useState(false);
   const [retroMode, setRetroMode] = useState(null);
@@ -1060,7 +1060,7 @@ function ScenarioMatrix({ prices, dates, phase, cycleData, label, hasRealData })
     );
   }
 
-  const currentPrice = prices[prices.length - 1];
+  const currentPrice = marketPrice || prices[prices.length - 1];
 
   // 일별 수익률
   const returns = [];
@@ -2148,6 +2148,7 @@ export default function IntegratedMonitor() {
   const [priceData, setPriceData] = useState({});
   const [dateData, setDateData] = useState({});
   const [irValues, setIrValues] = useState({});
+  const [marketPrices, setMarketPrices] = useState({});
   const [cycleData, setCycleData] = useState({ re: 0, im: 0 });
 
   // Stock recommendation state
@@ -2327,9 +2328,11 @@ export default function IntegratedMonitor() {
       const newPrices = {};
       const newDates = {};
       const newIR = {};
+      const newMarketPrices = {};
       Object.entries(parsed.symbols || {}).forEach(([sym, d]) => {
         const p = d.prices || [];
         newPrices[sym] = p;
+        if (d.current) newMarketPrices[sym] = d.current;
         if (d.timestamps) newDates[sym] = d.timestamps;
         if (p.length >= 20) {
           const ir = [];
@@ -2348,6 +2351,7 @@ export default function IntegratedMonitor() {
       setPriceData(newPrices);
       setDateData(newDates);
       setIrValues(newIR);
+      setMarketPrices(newMarketPrices);
 
       const m = parsed.macro || {};
       const re = clamp(
@@ -2394,7 +2398,7 @@ export default function IntegratedMonitor() {
   const currentPrices = priceData[activeSymbol] || [];
   const currentDates = dateData[activeSymbol] || [];
   const currentIR = irValues[activeSymbol] || [];
-  const lastPrice = currentPrices.length > 0 ? currentPrices[currentPrices.length - 1] : 0;
+  const lastPrice = marketPrices[activeSymbol] || (currentPrices.length > 0 ? currentPrices[currentPrices.length - 1] : 0);
   const lastIR = currentIR.length > 0 ? currentIR[currentIR.length - 1] : 1;
 
   return (
@@ -2616,6 +2620,7 @@ export default function IntegratedMonitor() {
           cycleData={cycleData}
           label={activeSymbol}
           hasRealData={hasRealData}
+          marketPrice={marketPrices[activeSymbol]}
         />
       )}
 
