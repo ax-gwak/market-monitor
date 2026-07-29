@@ -2470,7 +2470,7 @@ export default function IntegratedMonitor() {
           <div>
             {/* 날짜 + KOSPI200 현재값 */}
             {(() => {
-              const kospi200Price = priceData["KOSPI200"]?.[priceData["KOSPI200"].length - 1];
+              const kospi200Price = marketPrices["KOSPI200"] || priceData["KOSPI200"]?.[priceData["KOSPI200"].length - 1];
               const prevPrice = priceData["KOSPI200"]?.[priceData["KOSPI200"].length - 2];
               const change = kospi200Price && prevPrice ? kospi200Price - prevPrice : null;
               const changePct = change && prevPrice ? (change / prevPrice) * 100 : null;

@@ -73,6 +73,14 @@ async function fetchSparkBatch(yahooSymbols: string[]): Promise<Record<string, {
     const current: number = result.meta?.regularMarketPrice ?? prices.at(-1) ?? 0;
     const name: string = DISPLAY_NAMES[yahooSym] ?? result.meta?.shortName ?? yahooSym;
 
+    // 일봉 배열 마지막이 오래되었으면 regularMarketPrice를 끝에 보충
+    const regularMarketTime: number | undefined = result.meta?.regularMarketTime;
+    const lastTs = paired.at(-1)?.t ?? 0;
+    if (current > 0 && regularMarketTime && regularMarketTime - lastTs > 86400) {
+      prices.push(current);
+      timestamps.push(regularMarketTime * 1000);
+    }
+
     results[yahooSym] = { prices, timestamps, current, name };
   }
 
