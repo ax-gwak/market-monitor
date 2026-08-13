@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 /* ─── 심볼 매핑 ─── */
 const SYMBOL_MAP: Record<string, string> = {
-  KOSPI200: "^KS200",
+  KOSPI200: "069500.KS",
   KOSPI:    "^KS11",
   SPX:      "^GSPC",
   SP500:    "^GSPC",
@@ -16,16 +16,21 @@ const SYMBOL_MAP: Record<string, string> = {
 };
 
 const DISPLAY_NAMES: Record<string, string> = {
-  "^KS200":   "코스피200",
-  "^KS11":    "코스피",
-  "^GSPC":    "S&P 500",
-  "^IXIC":    "나스닥",
-  "^DJI":     "다우존스",
-  "^N225":    "니케이225",
-  "^HSI":     "항셍",
-  "GC=F":     "금",
-  "CL=F":     "원유 WTI",
-  "BTC-USD":  "비트코인",
+  "069500.KS": "코스피200",
+  "^KS11":     "코스피",
+  "^GSPC":     "S&P 500",
+  "^IXIC":     "나스닥",
+  "^DJI":      "다우존스",
+  "^N225":     "니케이225",
+  "^HSI":      "항셍",
+  "GC=F":      "금",
+  "CL=F":      "원유 WTI",
+  "BTC-USD":   "비트코인",
+};
+
+// KODEX 200 ETF 가격 → KOSPI200 지수 환산 (÷100)
+const PRICE_DIVISOR: Record<string, number> = {
+  "069500.KS": 100,
 };
 
 const UA = "Mozilla/5.0";
@@ -63,14 +68,16 @@ async function fetchSparkBatch(yahooSymbols: string[]): Promise<Record<string, {
 
     const rawTimestamps: number[] = result.timestamp ?? [];
     const rawCloses: (number | null)[] = result.indicators?.quote?.[0]?.close ?? [];
+    const divisor = PRICE_DIVISOR[yahooSym] ?? 1;
 
     const paired = rawTimestamps
       .map((t: number, i: number) => ({ t, c: rawCloses[i] }))
       .filter((p): p is { t: number; c: number } => p.c != null && isFinite(p.c));
 
-    const prices = paired.map(p => p.c);
+    const prices = paired.map(p => p.c / divisor);
     const timestamps = paired.map(p => p.t * 1000);
-    const current: number = result.meta?.regularMarketPrice ?? prices.at(-1) ?? 0;
+    const rawCurrent: number = result.meta?.regularMarketPrice ?? (prices.at(-1) ?? 0) * divisor;
+    const current = rawCurrent / divisor;
     const name: string = DISPLAY_NAMES[yahooSym] ?? result.meta?.shortName ?? yahooSym;
 
     // 일봉 배열 마지막이 오래되었으면 regularMarketPrice를 끝에 보충
